@@ -1,0 +1,121 @@
+name: Test report
+description: You ran VIctory (with your own copy of the title) and want to say how far it got and how it ended.
+title: "[GPU] how far it got, how it ended"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. Reports in this shape can be compared side by side, so a few precise answers help more than a long story.
+
+        **Never attach anything from the game**: no assets, executable data, shader dumps or extracted files ([asset policy](../blob/main/docs/asset-policy.md)). Logs and counts are fine.
+
+  - type: input
+    id: commit
+    attributes:
+      label: VIctory commit
+      description: "`git rev-parse --short HEAD`, plus any PRs or fork branches you merged on top."
+      placeholder: "ffe310e + #439 + #578"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: build
+    attributes:
+      label: Build
+      options:
+        - release (cargo build --release)
+        - diag (--profile diag --features diagnostics)
+        - debug
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: The adapter VIctory used, and its driver version.
+      placeholder: "RTX 3070, driver 621.24"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: System
+      options:
+        - Windows 11
+        - Windows 10, with the Agility SDK runtime beside victory.exe
+        - Windows 10, without it
+        - Linux (Wine / Proton)
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reached
+    attributes:
+      label: How far did it get?
+      description: The last stage you saw.
+      options:
+        - Did not start
+        - Boot / first-boot screens
+        - Intro video
+        - Start screen and menus
+        - Loading into the world
+        - In the world (picture dark or wrong)
+        - In the world (picture right)
+        - Gameplay
+    validations:
+      required: true
+
+  - type: dropdown
+    id: ended
+    attributes:
+      label: How did it end?
+      options:
+        - Still running when I stopped it
+        - GPU hang / device removed (screens went black, DXGI_ERROR_DEVICE_HUNG)
+        - VIctory crashed (see crashes.log)
+        - The title's own watchdog ended it
+        - Other (say below)
+    validations:
+      required: true
+
+  - type: input
+    id: time
+    attributes:
+      label: Time and frame rate
+      description: How long it ran, and the frame rate from the window caption where it matters.
+      placeholder: "about 50 s to the world, then ~1 fps; hung 25 s in"
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and anything you changed between runs.
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: Environment variables
+      description: Any VICTORY_* variables you set.
+      placeholder: "VICTORY_D3D12_DRED=1 VICTORY_SHADER_LOOP_LIMIT=4096"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpts
+      description: The end of crashes.log, DRED output, refusals ("no host pipeline", "does not translate"). Trim to what matters.
+      render: text
+
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Before you send
+      options:
+        - label: I ran my own copy of the title.
+          required: true
+        - label: Nothing from the game is attached or pasted (assets, executable data, shader dumps).
+          required: true

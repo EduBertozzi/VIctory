@@ -1,0 +1,53 @@
+name: Translator or runtime bug
+description: Something in VIctory's code is wrong, and you can point at it (a lowering, a binding, a state, a call).
+title: "Area: what is wrong"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For bugs you can trace to the code. Name the area in the title, the way commits do: `Shaders:`, `GPU:`, `HLE:`, `Loader:`, `Formats:`.
+
+  - type: textarea
+    id: wrong
+    attributes:
+      label: What is wrong
+      description: The behaviour, the code it comes from (file:line on a commit), and what it should do instead (with a reference, if you have one).
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to see it
+      description: Best is a synthetic test (hand-assembled GFX10, a D3D12 probe) that fails before a fix. Otherwise, what you ran.
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      placeholder: "ffe310e"
+    validations:
+      required: true
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Where you saw it
+      description: GPU and driver, system, if it matters.
+      placeholder: "RTX 4060, 621.24, Windows 11; also WARP"
+
+  - type: textarea
+    id: fix
+    attributes:
+      label: Fix, if you have one
+      description: A fork branch or commit and what it changes. Pull requests are open to collaborators only for now, so a fork branch is fine.
+
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Before you send
+      options:
+        - label: Nothing from the game is attached (assets, executable data, shader dumps).
+          required: true

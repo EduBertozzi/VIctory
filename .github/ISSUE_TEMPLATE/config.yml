@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Getting started
+    url: https://github.com/Marvisak/VIctory#getting-started
+    about: Requirements, building, and running the title from your own files.
+  - name: Hardware results thread
+    url: https://github.com/Marvisak/VIctory/issues/49
+    about: A short "it works / it doesn't on my hardware" note fits there.

@@ -1,0 +1,73 @@
+name: I can't get it to build or run
+description: VIctory does not build, does not start, or stops before the title shows anything.
+title: "Can't run: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Most of these come down to a few known things. Please check them first; they may save you the wait for an answer.
+
+        - **Windows 10:** its built-in D3D12 stops at shader model 6.5. VIctory needs 6.6, from Microsoft's D3D12 Agility SDK runtime placed beside `victory.exe` (see #84 and #175).
+        - **CPU and GPU:** a CPU with AVX2, and a D3D12 GPU with shader model 6.6. Reaching the world also needs mesh shaders.
+        - **`crashes.log` says Windows error 1455:** Windows ran out of commit memory. Close other programs or make the paging file bigger.
+        - **Paths:** `cargo run -p victory -- config` shows the paths VIctory uses, and whether they exist.
+        - **The game files:** VIctory runs files you supply from your own copy. It does not download, unpack or decrypt anything.
+
+  - type: input
+    id: command
+    attributes:
+      label: Command you ran
+      placeholder: "target\\release\\victory.exe run D:\\Game\\GTA6.exe --execute"
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: What you see
+      description: The error text or the last lines printed. Paste text rather than screenshots.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Output of `victory config`
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: System
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux (Wine / Proton)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      placeholder: "RX 6700 XT, Adrenalin 26.11.2"
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: VIctory commit
+      description: "`git rev-parse --short HEAD`"
+
+  - type: checkboxes
+    id: checked
+    attributes:
+      label: Checked
+      options:
+        - label: I read "Getting started" in the README and went through the list above.
+          required: true
