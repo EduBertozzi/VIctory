@@ -189,9 +189,10 @@ fn lowered(as_compute: bool) -> (HostShader, MeshLayout) {
 fn lowered_with(as_compute: bool, prims: bool) -> (HostShader, MeshLayout) {
     let native = program(prims);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
     let outputs = outputs();
     let l = lower::lower(&lower::Parts {
         native: &native,

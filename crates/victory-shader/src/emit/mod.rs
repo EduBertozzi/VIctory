@@ -268,9 +268,11 @@ pub fn translate_mesh_as_compute(container: &[u8]) -> Result<MeshFallback, Shade
             what: "a container without a mesh program",
         })?;
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
-    let res = resource::track(&p, &native.layout, native.stage)?;
+    // As `translate`: structurisation first, for per-lane descriptors.
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
-    let st = structure::structure(&p)?;
+    let st = st?;
     emit_mesh_as_compute(&c, &native, &p, &st, &io, &res)
 }
 
