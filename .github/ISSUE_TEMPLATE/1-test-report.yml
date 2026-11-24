@@ -1,13 +1,16 @@
 name: Test report
 description: You ran VIctory (with your own copy of the title) and want to say how far it got and how it ended.
-title: "[GPU] how far it got, how it ended"
+title: "[Test] "
 body:
   - type: markdown
     attributes:
       value: |
         Thanks for testing. Reports in this shape can be compared side by side, so a few precise answers help more than a long story.
 
-        **Never attach anything from the game**: no assets, executable data, shader dumps or extracted files ([asset policy](../blob/main/docs/asset-policy.md)). Logs and counts are fine.
+        - **Title:** your GPU, how far it got and how it ended, e.g. `[Test] RTX 3070: world, GPU hang after 25 s`.
+        - **Already reported?** Search the issues for your GPU first. A short "same here" with your commit helps too, and so does the hardware results thread (#49).
+        - **It did not start at all?** The "I can't get it to build or run" form fits better.
+        - **Never attach anything from the game**: no assets, executable data, shader dumps or extracted files ([asset policy](../blob/main/docs/asset-policy.md)). Logs and counts are fine.
 
   - type: input
     id: commit
@@ -26,6 +29,19 @@ body:
         - release (cargo build --release)
         - diag (--profile diag --features diagnostics)
         - debug
+    validations:
+      required: true
+
+  - type: dropdown
+    id: vendor
+    attributes:
+      label: GPU maker
+      description: Many problems differ by maker (NVIDIA's 32-lane waves, for one).
+      options:
+        - NVIDIA
+        - AMD
+        - Intel
+        - WARP (VICTORY_D3D12_WARP=1)
     validations:
       required: true
 
@@ -57,7 +73,7 @@ body:
       label: How far did it get?
       description: The last stage you saw.
       options:
-        - Did not start
+        - Did not start (the "can't build or run" form fits better)
         - Boot / first-boot screens
         - Intro video
         - Start screen and menus
