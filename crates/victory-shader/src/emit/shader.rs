@@ -16,6 +16,12 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// (vertex outputs), `u1` (triangle indices) and `u2` (per-primitive
 /// outputs) in this space.
 pub const MESH_OUT_SPACE: u32 = 2;
+/// How far a mesh program run as compute moves its user data, root views
+/// and immediate samplers (to spaces 8 and 9). The fallback's root
+/// signature gives them to every stage (compute sees only that), so in
+/// the spaces of the pixel shader drawn after it they would overlap the
+/// pixel shader's own `b0`, `s<n>` and root views, which D3D12 refuses.
+pub const MESH_COMPUTE_SPACES: u32 = 8;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -183,10 +189,11 @@ impl Shader {
 
     /// The handle of the user-data constant buffer, made in the entry block.
     pub fn user_data_handle(&mut self) -> V {
+        let space = USER_DATA_SPACE + self.space_shift();
         let bind = [
             self.m.i32(0),
             self.m.i32(0),
-            self.m.i32(USER_DATA_SPACE),
+            self.m.i32(space),
             self.m.i8(2), // CBV
         ];
         let bind = self.m.aggregate(self.t.bind, &bind);
@@ -211,7 +218,8 @@ impl Shader {
             return h;
         }
         let r = self.m.i32(u32::from(slot));
-        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(2)];
+        let space = ROOT_CBV_SPACE + self.space_shift();
+        let bind = [r, r, self.m.i32(space), self.m.i8(2)];
         let bind = self.m.aggregate(self.t.bind, &bind);
         let f = self.m.bool(false);
         let block = self.entry;
@@ -234,7 +242,8 @@ impl Shader {
             return h;
         }
         let r = self.m.i32(u32::from(slot));
-        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(0)];
+        let space = ROOT_CBV_SPACE + self.space_shift();
+        let bind = [r, r, self.m.i32(space), self.m.i8(0)];
         let bind = self.m.aggregate(self.t.bind, &bind);
         let f = self.m.bool(false);
         let block = self.entry;
@@ -305,10 +314,11 @@ impl Shader {
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
+        let space = SAMPLER_SPACE + self.space_shift();
         let bind = [
             self.m.i32(n),
             self.m.i32(n),
-            self.m.i32(SAMPLER_SPACE),
+            self.m.i32(space),
             self.m.i8(3), // sampler
         ];
         let bind = self.m.aggregate(self.t.bind, &bind);
@@ -370,6 +380,16 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
+    /// How far this shader's bindings are moved: [`MESH_COMPUTE_SPACES`] for
+    /// a mesh program run as compute.
+    fn space_shift(&self) -> u32 {
+        if self.mesh_as_compute {
+            MESH_COMPUTE_SPACES
+        } else {
+            0
+        }
+    }
+
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
         // Run as compute, a mesh program is a compute shader with no
@@ -380,6 +400,7 @@ impl Shader {
             self.outputs.clear();
             self.prims.clear();
         }
+        let shift = self.space_shift();
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -407,7 +428,7 @@ impl Shader {
                     Some(i32c(&mut self, 0)),
                     Some(self.m.md_value(u)),
                     Some(empty),
-                    Some(i32c(&mut self, USER_DATA_SPACE)),
+                    Some(i32c(&mut self, USER_DATA_SPACE + shift)),
                     Some(i32c(&mut self, 0)),
                     Some(i32c(&mut self, 1)),
                     Some(i32c(&mut self, ud_size)),
@@ -416,7 +437,7 @@ impl Shader {
                 cbv_list.push(Some(self.m.md_node(ops)));
                 bindings.push(Binding {
                     kind: 2,
-                    space: USER_DATA_SPACE,
+                    space: USER_DATA_SPACE + shift,
                     register: 0,
                     dxil_kind: 13,
                 });
@@ -430,7 +451,7 @@ impl Shader {
                     Some(i32c(&mut self, cbv_list.len() as u32)),
                     Some(self.m.md_value(u)),
                     Some(empty),
-                    Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                    Some(i32c(&mut self, ROOT_CBV_SPACE + shift)),
                     Some(i32c(&mut self, u32::from(slot))),
                     Some(i32c(&mut self, 1)),
                     Some(i32c(&mut self, 65536)),
@@ -439,7 +460,7 @@ impl Shader {
                 cbv_list.push(Some(self.m.md_node(ops)));
                 bindings.push(Binding {
                     kind: 2,
-                    space: ROOT_CBV_SPACE,
+                    space: ROOT_CBV_SPACE + shift,
                     register: u32::from(slot),
                     dxil_kind: 13,
                 });
@@ -452,7 +473,7 @@ impl Shader {
             let mut raw: Vec<(u32, u32)> = self
                 .root_srvs
                 .iter()
-                .map(|r| (ROOT_CBV_SPACE, u32::from(r.0)))
+                .map(|r| (ROOT_CBV_SPACE + shift, u32::from(r.0)))
                 .collect();
             for r in 0..3u32 {
                 if self.mesh_in[r as usize].is_some() {
@@ -539,7 +560,7 @@ impl Shader {
                         Some(i32c(&mut self, n)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, SAMPLER_SPACE)),
+                        Some(i32c(&mut self, SAMPLER_SPACE + shift)),
                         Some(i32c(&mut self, n)),
                         Some(i32c(&mut self, 1)),
                         // Sampler kind: 1 comparison.
@@ -549,7 +570,7 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 1,
-                        space: SAMPLER_SPACE,
+                        space: SAMPLER_SPACE + shift,
                         register: n,
                         dxil_kind: 14,
                     });

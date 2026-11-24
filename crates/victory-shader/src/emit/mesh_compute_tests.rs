@@ -1263,3 +1263,143 @@ fn fallback_frame_cost() {
         println!("{line}");
     }
 }
+
+/// [`program`] reading user-data dword 0 (`s8` in a mesh program) into its
+/// vertices' z and `TEXCOORD0.w`, with that dword a root constant.
+fn program_with_user_data() -> NativeProgram {
+    let mut native = program(false);
+    let (zero, user) = (vop1(0x001, 3, ZERO), vop1(0x001, 3, 8)); // v_mov_b32 v3, 0 / s8
+    let words: Vec<u32> = native
+        .code
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
+        .map(|w| if w == zero { user } else { w })
+        .collect();
+    assert!(words.contains(&user), "the program sets v3 to 0");
+    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    native.layout = vec![crate::native::RootParam {
+        root: crate::native::RootType::Constants,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    }];
+    native
+}
+
+/// `native` lowered as a mesh shader or, with `as_compute`, as compute, with
+/// the user data it reads.
+fn lowered_native(native: &NativeProgram, as_compute: bool) -> HostShader {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: outputs(),
+        prims: Vec::new(),
+        mesh_stride: 3,
+        mesh_as_compute: as_compute,
+    })
+    .expect("lower");
+    let s = HostShader {
+        user_data: l.user_data,
+        ..shader(HwStage::Ms, l.dxil)
+    };
+    validate(&s);
+    s
+}
+
+/// A root signature laid out as `victory-gpu` lays out a fallback's: the
+/// mesh stage's user data (`b0` in `mesh_space`) visible to all, the pixel
+/// shader's own `b0` (space 0) to the pixel stage, and the compute form's
+/// outputs `u0`-`u2` in [`MESH_OUT_SPACE`].
+fn fallback_root(host: &Host, mesh_space: u32) -> Result<ID3D12RootSignature, String> {
+    let constants = |space, visibility| D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Constants: D3D12_ROOT_CONSTANTS {
+                ShaderRegister: 0,
+                RegisterSpace: space,
+                Num32BitValues: 4,
+            },
+        },
+        ShaderVisibility: visibility,
+    };
+    let mut params = vec![
+        constants(mesh_space, D3D12_SHADER_VISIBILITY_ALL),
+        constants(super::USER_DATA_SPACE, D3D12_SHADER_VISIBILITY_PIXEL),
+    ];
+    params.extend((0..3).map(|r| D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: r,
+                RegisterSpace: MESH_OUT_SPACE,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }));
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: plain D3D12 calls with descriptions that outlive them.
+    unsafe {
+        let mut blob = None;
+        let mut errors = None;
+        if D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut errors)).is_err() {
+            return Err("serialization refused".into());
+        }
+        let blob: ID3DBlob = blob.ok_or("no root signature blob")?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        host.device.CreateRootSignature(0, bytes).map_err(err)
+    }
+}
+
+/// The fallback's root signature gives the mesh stage to every stage
+/// (compute sees only ALL), so in the usual spaces its `b0` would overlap
+/// the pixel shader's, which D3D12 refuses (seen on an RX 470 with the
+/// title, #961). Run as compute, the mesh program binds in spaces of its
+/// own instead, and its pipeline matches them.
+#[test]
+fn the_compute_form_binds_clear_of_the_pixel_shader() {
+    let native = program_with_user_data();
+    let cs = lowered_native(&native, true);
+    assert_eq!(cs.user_data_dwords(), 4, "the compute form reads user data");
+    assert_eq!(cs.space_shift(), super::MESH_COMPUTE_SPACES);
+    assert_eq!(lowered_native(&native, false).space_shift(), 0);
+    assert_eq!(pixel_shader(false).space_shift(), 0);
+    let host = Host::new(false)
+        .or_else(|_| Host::new(true))
+        .expect("an SM 6.6 hardware or WARP device");
+    // In the usual spaces: refused.
+    assert!(
+        fallback_root(&host, super::USER_DATA_SPACE).is_err(),
+        "D3D12 accepted overlapping b0 ranges"
+    );
+    // In the compute form's: accepted, and its pipeline builds against it.
+    let shift = super::USER_DATA_SPACE + cs.space_shift();
+    let root = fallback_root(&host, shift).expect("root signature");
+    host.compute_pipeline_with(&root, &cs.dxil)
+        .expect("compute pipeline against the moved spaces");
+}

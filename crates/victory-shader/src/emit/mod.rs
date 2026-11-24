@@ -100,7 +100,9 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{MESH_OUT_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{
+    MESH_COMPUTE_SPACES, MESH_OUT_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -172,6 +174,24 @@ impl HostShader {
             .max()
             .unwrap_or(0);
         n.next_multiple_of(4)
+    }
+
+    /// How far its user data, root views and immediate samplers are moved
+    /// from [`USER_DATA_SPACE`], [`ROOT_CBV_SPACE`] and [`SAMPLER_SPACE`]:
+    /// [`MESH_COMPUTE_SPACES`] for a mesh program lowered as compute (a
+    /// [`MeshFallback`]'s `compute`), 0 for any other shader.
+    pub fn space_shift(&self) -> u32 {
+        let compute = || -> Option<bool> {
+            let c = Container::parse(&self.dxil).ok()?;
+            let word = c.part(FourCC::DXIL)?.data.get(0..4)?;
+            // The program version word: kind 5 is compute.
+            Some(u32::from_le_bytes(word.try_into().ok()?) >> 16 == 5)
+        };
+        if self.stage == HwStage::Ms && compute() == Some(true) {
+            MESH_COMPUTE_SPACES
+        } else {
+            0
+        }
     }
 }
 

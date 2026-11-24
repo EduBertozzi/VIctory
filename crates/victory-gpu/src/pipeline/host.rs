@@ -8,7 +8,9 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{MESH_OUT_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    MESH_COMPUTE_SPACES, MESH_OUT_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -380,8 +382,16 @@ impl HostPipeline {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
-        for &(shader, visibility) in &stages {
+        for (index, &(shader, visibility)) in stages.iter().enumerate() {
             let t = &shader.translated()?.host;
+            // The mesh stage run as compute binds in its own spaces (the
+            // compute form's), which keeps its ALL-visible parameters clear
+            // of the pixel shader's.
+            let shift = if fallback.is_some() && index == 0 {
+                MESH_COMPUTE_SPACES
+            } else {
+                0
+            };
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
@@ -396,7 +406,7 @@ impl HostPipeline {
                     Anonymous: D3D12_ROOT_PARAMETER1_0 {
                         Constants: D3D12_ROOT_CONSTANTS {
                             ShaderRegister: 0,
-                            RegisterSpace: USER_DATA_SPACE,
+                            RegisterSpace: USER_DATA_SPACE + shift,
                             Num32BitValues: dwords,
                         },
                     },
@@ -422,7 +432,7 @@ impl HostPipeline {
                         Anonymous: D3D12_ROOT_PARAMETER1_0 {
                             Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                                 ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
+                                RegisterSpace: ROOT_CBV_SPACE + shift,
                                 Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
                             },
                         },
@@ -443,7 +453,7 @@ impl HostPipeline {
                     MinLOD: s.min_lod,
                     MaxLOD: s.max_lod,
                     ShaderRegister: n as u32,
-                    RegisterSpace: SAMPLER_SPACE,
+                    RegisterSpace: SAMPLER_SPACE + shift,
                     ShaderVisibility: visibility,
                 });
             }
