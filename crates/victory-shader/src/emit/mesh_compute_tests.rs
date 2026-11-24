@@ -187,7 +187,19 @@ fn lowered(as_compute: bool) -> (HostShader, MeshLayout) {
 }
 
 fn lowered_with(as_compute: bool, prims: bool) -> (HostShader, MeshLayout) {
-    let native = program(prims);
+    lowered_with_max_primitives(as_compute, prims, 3)
+}
+
+fn lowered_with_max_primitives(
+    as_compute: bool,
+    prims: bool,
+    max_primitives: u32,
+) -> (HostShader, MeshLayout) {
+    let mut native = program(prims);
+    let StageIo::Ms(mesh) = &mut native.io else {
+        unreachable!()
+    };
+    mesh.max_primitives = max_primitives;
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res =
@@ -203,7 +215,7 @@ fn lowered_with(as_compute: bool, prims: bool) -> (HostShader, MeshLayout) {
         inputs: Vec::new(),
         outputs: outputs.clone(),
         prims: prim_outputs(prims),
-        mesh_stride: 3,
+        mesh_stride: max_primitives,
         mesh_as_compute: as_compute,
     })
     .expect("lower");
@@ -212,7 +224,7 @@ fn lowered_with(as_compute: bool, prims: bool) -> (HostShader, MeshLayout) {
     let layout = MeshLayout {
         threads: 3,
         max_vertices: 3,
-        max_primitives: 3,
+        max_primitives,
         vertex_dwords: 4 * outputs.len() as u32,
         primitive_dwords: 4 * prim_outputs(prims).len() as u32,
     };
@@ -561,6 +573,30 @@ fn run_compute(
         })
         .collect::<Result<_, _>>()?;
     let (_alloc, list) = gpu.list()?;
+    let index_seed = gpu.buffer(
+        D3D12_HEAP_TYPE_UPLOAD,
+        sizes[1],
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+    )?;
+    // SAFETY: the upload and index buffers have the same size and are live through submission.
+    unsafe {
+        let mut p = std::ptr::null_mut();
+        index_seed.Map(0, None, Some(&mut p)).map_err(err)?;
+        std::slice::from_raw_parts_mut(p.cast::<u32>(), sizes[1] as usize / 4).fill(1);
+        index_seed.Unmap(0, None);
+        list.ResourceBarrier(&[transition(
+            &outs[1],
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )]);
+        list.CopyResource(&outs[1], &index_seed);
+        list.ResourceBarrier(&[transition(
+            &outs[1],
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )]);
+    }
     gpu.record_compute(&list, &pso, &outs, groups);
     // SAFETY: plain D3D12 recording of live resources.
     unsafe {
@@ -613,6 +649,21 @@ fn a_mesh_program_run_as_compute_writes_its_vertices_and_triangles() {
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn mesh_compute_initializes_more_primitive_slots_than_lanes() {
+    let (cs, layout) = lowered_with_max_primitives(true, false, 4);
+    let host = Host::new(false)
+        .or_else(|_| Host::new(true))
+        .expect("an SM 6.6 hardware or WARP device");
+    let [_, indices] = run_compute(&host, &cs, &layout, 2).unwrap();
+    assert_eq!(indices.len(), 24);
+    for (group, records) in indices.as_chunks::<12>().0.iter().enumerate() {
+        let base = 3 * group as u32;
+        assert_eq!(&records[..3], &[base, base + 1, base + 2]);
+        assert_eq!(&records[3..], &[0; 9], "unused indices, group {group}");
+    }
 }
 
 /// How [`render`] draws the program.

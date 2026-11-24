@@ -1943,7 +1943,7 @@ impl<'a> Lower<'a> {
         if mesh.topology != 2 {
             return Err("a mesh shader not drawing triangles");
         }
-        if threads > 128 || mesh.max_vertices > 256 || mesh.max_primitives > 256 {
+        if !(1..=128).contains(&threads) || mesh.max_vertices > 256 || mesh.max_primitives > 256 {
             return Err("a mesh shader beyond the host's limits");
         }
         let e = self.s.entry;
@@ -1973,6 +1973,20 @@ impl<'a> Lower<'a> {
             );
         }
         self.end_guarded(at, &[]);
+        if self.s.mesh_as_compute {
+            // The fallback draw consumes every declared primitive record,
+            // including slots above the last thread in the group.
+            for first in (threads..mesh.max_primitives).step_by(threads as usize) {
+                let c = self.cur;
+                let offset = self.s.m.i32(first);
+                let slot = self.s.m.bin(c, Bin::Add, flat, offset);
+                let guard = (first + threads > mesh.max_primitives)
+                    .then(|| self.s.m.cmp(c, pred::IULT, slot, p));
+                let at = self.begin_guarded(guard);
+                self.mesh_out_store(MESH_INDICES, slot, &[z, z, z]);
+                self.end_guarded(at, &[]);
+            }
+        }
         Ok(())
     }
 
