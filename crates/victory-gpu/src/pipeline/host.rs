@@ -271,8 +271,12 @@ pub(crate) struct MeshFallback {
     pub(crate) layout: victory_shader::emit::MeshLayout,
     /// Root parameters of `u0`, `u1` and `u2` in `MESH_OUT_SPACE`.
     pub(crate) outputs: [u32; 3],
-    /// Root parameter of `t0` in `MESH_OUT_SPACE` (the vertex records).
-    pub(crate) vertices: u32,
+    /// Root parameters of `t0`, `t1` and `t2` in `MESH_OUT_SPACE` (the same
+    /// buffers, for the vertex shader).
+    pub(crate) inputs: [u32; 3],
+    /// Drawn unindexed, three vertices per primitive (the program has
+    /// per-primitive outputs); else indexed by `u1`.
+    pub(crate) expanded: bool,
 }
 
 pub(crate) struct HostPipeline {
@@ -331,12 +335,7 @@ impl HostPipeline {
                 let Some(f) = ms.mesh_fallback() else {
                     return refuse("the mesh shader does not translate as compute", shaders);
                 };
-                let Some(vertex) = &f.vertex else {
-                    return refuse(
-                        "per-primitive mesh outputs are not drawn without mesh shaders",
-                        shaders,
-                    );
-                };
+                let vertex = &f.vertex;
                 let t = &ms.translated()?.host;
                 let c = &f.compute;
                 if c.user_data != t.user_data
@@ -447,7 +446,7 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        // The fallback's buffers: u0-u2 for the compute pass, t0 for the
+        // The fallback's buffers: u0-u2 for the compute pass, t0-t2 for the
         // vertex shader.
         let fallback_params = fallback.as_ref().map(|_| {
             let first = params.len() as u32;
@@ -458,6 +457,8 @@ impl HostPipeline {
                 (1, uav, all),
                 (2, uav, all),
                 (0, srv, vertex),
+                (1, srv, vertex),
+                (2, srv, vertex),
             ] {
                 params.push(D3D12_ROOT_PARAMETER1 {
                     ParameterType: kind,
@@ -471,7 +472,10 @@ impl HostPipeline {
                     ShaderVisibility: visibility,
                 });
             }
-            ([first, first + 1, first + 2], first + 3)
+            (
+                [first, first + 1, first + 2],
+                [first + 3, first + 4, first + 5],
+            )
         });
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
@@ -530,7 +534,7 @@ impl HostPipeline {
             return refuse("graphics state not kept (plain description)", shaders);
         };
         let state = g.describe();
-        if let (Some((f, vertex)), Some((outputs, vertices))) = (fallback, fallback_params) {
+        if let (Some((f, vertex)), Some((outputs, inputs))) = (fallback, fallback_params) {
             let bytes = |dxil: &[u8]| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: dxil.as_ptr().cast(),
                 BytecodeLength: dxil.len(),
@@ -594,7 +598,12 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, layout = ?f.layout, "host mesh pipeline, run as compute");
+            tracing::info!(
+                ?shaders,
+                layout = ?f.layout,
+                expanded = f.expanded,
+                "host mesh pipeline, run as compute"
+            );
             crate::host::name(&pso, || format!("{shaders:?} fallback"));
             crate::host::name(&compute_pso, || format!("{shaders:?} fallback compute"));
             return Some(HostPipeline {
@@ -604,7 +613,8 @@ impl HostPipeline {
                     compute: compute_pso,
                     layout: f.layout,
                     outputs,
-                    vertices,
+                    inputs,
+                    expanded: f.expanded,
                 }),
                 pso,
                 root,

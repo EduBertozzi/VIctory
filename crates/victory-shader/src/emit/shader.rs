@@ -64,10 +64,10 @@ pub(crate) struct Shader {
     pub mesh_as_compute: bool,
     /// Handles of the [`MESH_OUT_SPACE`] UAVs, by register.
     mesh_out: [Option<V>; 3],
-    /// The handle of `t0` in [`MESH_OUT_SPACE`]: the vertex records a mesh
-    /// program run as compute wrote, read by the vertex shader that draws
-    /// them.
-    mesh_vertices: Option<V>,
+    /// Handles of `t0`-`t2` in [`MESH_OUT_SPACE`], by register: what a mesh
+    /// program run as compute wrote to `u0`-`u2`, read by the vertex shader
+    /// that draws it.
+    mesh_in: [Option<V>; 3],
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -128,7 +128,7 @@ impl Shader {
             mesh: None,
             mesh_as_compute: false,
             mesh_out: [None; 3],
-            mesh_vertices: None,
+            mesh_in: [None; 3],
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
@@ -274,13 +274,13 @@ impl Shader {
         h
     }
 
-    /// The handle of the mesh vertex records, `t0` in [`MESH_OUT_SPACE`] (a
-    /// raw buffer), made in the entry block.
-    pub fn mesh_vertices_handle(&mut self) -> V {
-        if let Some(h) = self.mesh_vertices {
+    /// The handle of `t<register>` in [`MESH_OUT_SPACE`] (a raw buffer: what
+    /// the mesh program wrote to `u<register>`), made in the entry block.
+    pub fn mesh_in_handle(&mut self, register: u8) -> V {
+        if let Some(h) = self.mesh_in[usize::from(register)] {
             return h;
         }
-        let r = self.m.i32(0);
+        let r = self.m.i32(u32::from(register));
         let bind = [r, r, self.m.i32(MESH_OUT_SPACE), self.m.i8(0)]; // SRV
         let bind = self.m.aggregate(self.t.bind, &bind);
         let f = self.m.bool(false);
@@ -295,7 +295,7 @@ impl Shader {
         );
         let h = self.annotate(block, h, 11, 0);
         self.flags |= flags::RAW_BUFFERS;
-        self.mesh_vertices = Some(h);
+        self.mesh_in[usize::from(register)] = Some(h);
         h
     }
 
@@ -381,7 +381,7 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || self.mesh_out.iter().any(Option::is_some)
-            || self.mesh_vertices.is_some()
+            || self.mesh_in.iter().any(Option::is_some)
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -442,8 +442,10 @@ impl Shader {
                 .iter()
                 .map(|r| (ROOT_CBV_SPACE, u32::from(r.0)))
                 .collect();
-            if self.mesh_vertices.is_some() {
-                raw.push((MESH_OUT_SPACE, 0));
+            for r in 0..3u32 {
+                if self.mesh_in[r as usize].is_some() {
+                    raw.push((MESH_OUT_SPACE, r));
+                }
             }
             if !raw.is_empty() {
                 let ty = self

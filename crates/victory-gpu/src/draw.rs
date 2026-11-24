@@ -623,7 +623,9 @@ impl State {
             once!(x, "a mesh fallback draw with more than 4 GiB of indices");
             return false;
         };
-        let Some(buffer) = list.mesh_scratch(at_prims + prims) else {
+        // (At least a little past `u2`'s start, so its address is in the
+        // buffer even when the program has no per-primitive outputs.)
+        let Some(buffer) = list.mesh_scratch(at_prims + prims.max(16)) else {
             return false;
         };
         list.keep(&buffer);
@@ -670,16 +672,24 @@ impl State {
         if drawn {
             // SAFETY: an open list with the draw bound.
             unsafe {
-                l.SetGraphicsRootShaderResourceView(f.vertices, base);
-                l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
-                    BufferLocation: base + at_indices,
-                    SizeInBytes: index_bytes,
-                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
-                }));
+                for (param, at) in f.inputs.into_iter().zip([0, at_indices, at_prims]) {
+                    l.SetGraphicsRootShaderResourceView(param, base + at);
+                }
                 l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4)); // triangle list
                 #[cfg(feature = "diagnostics")]
                 list.note_op(|| self.op_text(format!("mesh {x} drawn"), false));
-                l.DrawIndexedInstanced(3 * f.layout.max_primitives * x, 1, 0, 0, 0);
+                let n = 3 * f.layout.max_primitives * x;
+                if f.expanded {
+                    // Three corners per primitive, read through t1 and t2.
+                    l.DrawInstanced(n, 1, 0, 0);
+                } else {
+                    l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                        BufferLocation: base + at_indices,
+                        SizeInBytes: index_bytes,
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                    }));
+                    l.DrawIndexedInstanced(n, 1, 0, 0, 0);
+                }
             }
             // Later draws keep the title's topology.
             self.set_topology(list, self.topology);

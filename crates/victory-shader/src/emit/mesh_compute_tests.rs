@@ -71,8 +71,10 @@ const fn vgpr(n: u8) -> u16 {
 
 /// One triangle per group from three lanes. Lane n exports vertex n at
 /// (n - 1, 2 (n & 1) - 1, 0, 1) with `TEXCOORD0` (n, 1, 2, 0), and
-/// primitive n: lane 0 the triangle (0, 1, 2), lanes 1 and 2 culled ones.
-fn program() -> NativeProgram {
+/// primitive n: lane 0 the triangle (0, 1, 2), lanes 1 and 2 culled ones;
+/// with `prims`, primitive n also has the per-primitive `COLOR0`
+/// (1, 2, n, 0).
+fn program(prims: bool) -> NativeProgram {
     let mut w = Vec::new();
     w.extend(vop3(0x365, 0, MINUS_ONE, ZERO, 0)); // v_mbcnt_lo_u32_b32 v0, -1, 0: the lane
     w.push(vop1(0x006, 1, vgpr(0))); // v_cvt_f32_u32 v1, v0
@@ -92,8 +94,23 @@ fn program() -> NativeProgram {
     w.push(vop2(0x25, 6, 11, 6)); // v_add_nc_u32 v6, s11, v6
     w.extend(exp(20, [Some(6), None, None, None], true)); // exp prim
     w.extend(exp(32, [Some(1), Some(4), Some(2), Some(3)], false)); // exp param0
+    if prims {
+        w.extend(exp(33, [Some(4), Some(2), Some(1), Some(3)], false)); // exp param1
+    }
     w.extend(exp(12, [Some(7), Some(8), Some(3), Some(4)], true)); // exp pos0
     w.push(S_ENDPGM);
+    let output = |row, param| VsOutput {
+        usage: Usage::Generic,
+        row,
+        param,
+        fp16: false,
+        pack2: false,
+    };
+    let mut outputs = vec![output(1, 0)];
+    if prims {
+        // Bit 7: per-primitive, row 0 of the primitive signature.
+        outputs.push(output(0, 0x81));
+    }
     NativeProgram {
         stage: HwStage::Ms,
         wave64: false,
@@ -101,13 +118,7 @@ fn program() -> NativeProgram {
         layout: vec![],
         used: vec![],
         io: StageIo::Ms(MeshIo {
-            outputs: vec![VsOutput {
-                usage: Usage::Generic,
-                row: 1,
-                param: 0,
-                fp16: false,
-                pack2: false,
-            }],
+            outputs,
             clip_cntl: 0,
             threads: 3,
             max_vertices: 3,
@@ -119,8 +130,8 @@ fn program() -> NativeProgram {
     }
 }
 
-fn outputs() -> Vec<SigElement> {
-    let element = |name: &str, kind, interp, row| SigElement {
+fn element(name: &str, kind: u8, interp: u8, row: u32) -> SigElement {
+    SigElement {
         name: name.into(),
         index: 0,
         kind,
@@ -131,11 +142,23 @@ fn outputs() -> Vec<SigElement> {
         cols: 4,
         usage: 0,
         half: false,
-    };
+    }
+}
+
+fn outputs() -> Vec<SigElement> {
     vec![
         element("SV_Position", 3, 4, 0),
         element("TEXCOORD", 0, 2, 1),
     ]
+}
+
+/// The primitive signature (constant, as `emit` declares it).
+fn prim_outputs(prims: bool) -> Vec<SigElement> {
+    if prims {
+        vec![element("COLOR", 0, 1, 0)]
+    } else {
+        Vec::new()
+    }
 }
 
 fn validate(shader: &HostShader) {
@@ -160,7 +183,11 @@ fn shader(stage: HwStage, dxil: Vec<u8>) -> HostShader {
 /// The program lowered as a mesh shader or, with `as_compute`, a compute
 /// shader with its layout; validated when `dxil.dll` is there.
 fn lowered(as_compute: bool) -> (HostShader, MeshLayout) {
-    let native = program();
+    lowered_with(as_compute, false)
+}
+
+fn lowered_with(as_compute: bool, prims: bool) -> (HostShader, MeshLayout) {
+    let native = program(prims);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
@@ -174,7 +201,7 @@ fn lowered(as_compute: bool) -> (HostShader, MeshLayout) {
         res: &res,
         inputs: Vec::new(),
         outputs: outputs.clone(),
-        prims: Vec::new(),
+        prims: prim_outputs(prims),
         mesh_stride: 3,
         mesh_as_compute: as_compute,
     })
@@ -186,30 +213,51 @@ fn lowered(as_compute: bool) -> (HostShader, MeshLayout) {
         max_vertices: 3,
         max_primitives: 3,
         vertex_dwords: 4 * outputs.len() as u32,
-        primitive_dwords: 0,
+        primitive_dwords: 4 * prim_outputs(prims).len() as u32,
     };
     (s, layout)
 }
 
 /// The fallback's vertex shader for the program.
 fn fallback_vs(layout: &MeshLayout) -> HostShader {
+    fallback_vs_with(layout, false)
+}
+
+fn fallback_vs_with(layout: &MeshLayout, prims: bool) -> HostShader {
     let vs = shader(
         HwStage::Vs,
-        mesh_vs::vertex_shader(&outputs(), layout.vertex_dwords),
+        mesh_vs::vertex_shader(
+            &outputs(),
+            &prim_outputs(prims),
+            layout.vertex_dwords,
+            layout.primitive_dwords,
+        ),
     );
     validate(&vs);
     vs
 }
 
-/// A pixel shader writing `TEXCOORD0` to target 0.
-fn texcoord_ps() -> HostShader {
+/// A pixel shader writing `TEXCOORD0` to target 0 or, with `prims`,
+/// (`TEXCOORD0.xy`, `COLOR0.xy`): `COLOR0` a constant input after the
+/// vertex outputs, linked to the per-primitive output by its semantic.
+fn pixel_shader(prims: bool) -> HostShader {
     let mut s = Shader::new(true);
     let mut inputs = outputs();
-    inputs[1].usage = 0xF;
+    inputs[1].usage = if prims { 0x3 } else { 0xF };
+    if prims {
+        let mut color = element("COLOR", 0, 1, 2);
+        color.usage = 0x3;
+        inputs.push(color);
+    }
     s.inputs = inputs;
     let e = s.entry;
     for col in 0..4u8 {
-        let args = [s.m.i32(1), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+        // (input element, its channel) for target channel `col`.
+        let (id, ch) = match (prims, col) {
+            (true, 2 | 3) => (2, col - 2),
+            _ => (1, col),
+        };
+        let args = [s.m.i32(id), s.m.i32(0), s.m.i8(ch), s.m.undef(s.t.i32)];
         let x = s.op(e, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
         let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), x];
         s.op(e, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
@@ -282,7 +330,8 @@ fn transition(
 }
 
 const SIZE: u32 = 32;
-/// Root parameters: `u0`-`u2` (0-2) and `t0` (3) in [`MESH_OUT_SPACE`].
+/// Root parameters: `u0`-`u2` (0-2) and `t0`-`t2` (3-5) in
+/// [`MESH_OUT_SPACE`].
 const VERTICES_SRV: u32 = 3;
 
 impl<'a> Gpu<'a> {
@@ -301,17 +350,17 @@ impl<'a> Gpu<'a> {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             })
             .collect();
-        params.push(D3D12_ROOT_PARAMETER1 {
+        params.extend((0..3).map(|r| D3D12_ROOT_PARAMETER1 {
             ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
             Anonymous: D3D12_ROOT_PARAMETER1_0 {
                 Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                    ShaderRegister: 0,
+                    ShaderRegister: r,
                     RegisterSpace: MESH_OUT_SPACE,
                     Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                 },
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        });
+        }));
         let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
             Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
             Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
@@ -569,11 +618,13 @@ fn a_mesh_program_run_as_compute_writes_its_vertices_and_triangles() {
 enum Draw<'a> {
     /// As a mesh shader.
     Mesh(&'a HostShader),
-    /// Run as compute, then drawn by the fallback vertex shader.
+    /// Run as compute, then drawn by the fallback vertex shader (unindexed
+    /// when `expanded`).
     Fallback {
         cs: &'a HostShader,
         vs: &'a HostShader,
         layout: &'a MeshLayout,
+        expanded: bool,
     },
 }
 
@@ -643,27 +694,24 @@ fn render(host: &Host, draw: &Draw, ps: &HostShader, groups: u32) -> Result<Vec<
         dev.CreateRenderTargetView(&target, None, rtv);
         let draw_pso = match *draw {
             Draw::Mesh(ms) => host.mesh_pipeline_with(&gpu.root, &ms.dxil, &ps.dxil)?,
-            Draw::Fallback { cs, vs, layout } => {
+            Draw::Fallback { cs, vs, layout, .. } => {
                 let cs_pso = host.compute_pipeline_with(&gpu.root, &cs.dxil)?;
                 let outs = gpu.mesh_buffers(layout, groups)?;
                 gpu.record_compute(&list, &cs_pso, &outs, groups);
-                list.ResourceBarrier(&[
-                    transition(
-                        &outs[0],
-                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                    ),
-                    transition(
-                        &outs[1],
-                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        D3D12_RESOURCE_STATE_INDEX_BUFFER,
-                    ),
-                ]);
+                let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                    | D3D12_RESOURCE_STATE_INDEX_BUFFER;
+                let barriers: Vec<_> = outs
+                    .iter()
+                    .map(|o| transition(o, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read))
+                    .collect();
+                list.ResourceBarrier(&barriers);
                 list.SetGraphicsRootSignature(&gpu.root);
-                list.SetGraphicsRootShaderResourceView(
-                    VERTICES_SRV,
-                    outs[0].GetGPUVirtualAddress(),
-                );
+                for (k, o) in outs.iter().enumerate() {
+                    list.SetGraphicsRootShaderResourceView(
+                        VERTICES_SRV + k as u32,
+                        o.GetGPUVirtualAddress(),
+                    );
+                }
                 list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
                     BufferLocation: outs[1].GetGPUVirtualAddress(),
                     SizeInBytes: layout.bytes(groups)[1] as u32,
@@ -694,8 +742,15 @@ fn render(host: &Host, draw: &Draw, ps: &HostShader, groups: u32) -> Result<Vec<
         }]);
         match *draw {
             Draw::Mesh(_) => list.DispatchMesh(groups, 1, 1),
-            Draw::Fallback { layout, .. } => {
-                list.DrawIndexedInstanced(3 * layout.max_primitives * groups, 1, 0, 0, 0);
+            Draw::Fallback {
+                layout, expanded, ..
+            } => {
+                let n = 3 * layout.max_primitives * groups;
+                if expanded {
+                    list.DrawInstanced(n, 1, 0, 0);
+                } else {
+                    list.DrawIndexedInstanced(n, 1, 0, 0, 0);
+                }
             }
         }
         list.ResourceBarrier(&[transition(
@@ -757,14 +812,27 @@ fn same_image(a: &[[f32; 4]], b: &[[f32; 4]], tolerance: f32) -> Result<(), Stri
 
 #[test]
 fn a_mesh_program_run_as_compute_draws_what_the_mesh_shader_draws() {
-    let (ms, _) = lowered(false);
-    let (cs, layout) = lowered(true);
-    let vs = fallback_vs(&layout);
-    let ps = texcoord_ps();
+    compare_with_the_mesh_shader(false);
+}
+
+#[test]
+fn per_primitive_outputs_run_as_compute_draw_what_the_mesh_shader_draws() {
+    compare_with_the_mesh_shader(true);
+}
+
+/// Draws the program (with `prims`, its per-primitive variant) with the
+/// fallback on every device and compares with the first mesh-capable
+/// device's mesh shader.
+fn compare_with_the_mesh_shader(prims: bool) {
+    let (ms, _) = lowered_with(false, prims);
+    let (cs, layout) = lowered_with(true, prims);
+    let vs = fallback_vs_with(&layout, prims);
+    let ps = pixel_shader(prims);
     let fallback = Draw::Fallback {
         cs: &cs,
         vs: &vs,
         layout: &layout,
+        expanded: prims,
     };
     let groups = 2;
     let mut reference = None;
@@ -791,9 +859,15 @@ fn a_mesh_program_run_as_compute_draws_what_the_mesh_shader_draws() {
             "{label}: {} texels",
             covered.len()
         );
+        // TEXCOORD0.z = 2, or the primitive's COLOR0.xy = (1, 2).
         assert!(
-            covered.iter().all(|t| t[1] == 1.0 && t[2] == 2.0),
-            "{label}"
+            covered.iter().all(|t| if prims {
+                t[2] == 1.0 && t[3] == 2.0
+            } else {
+                t[2] == 2.0
+            }),
+            "{label}: {:?}",
+            covered[0]
         );
         images.push((label, image));
     }

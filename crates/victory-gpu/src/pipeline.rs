@@ -145,7 +145,7 @@ impl Shader {
                     Ok(f) => tracing::info!(
                         hash = %self.hash,
                         layout = ?f.layout,
-                        drawable = f.vertex.is_some(),
+                        expanded = f.expanded,
                         "mesh shader translated as compute"
                     ),
                     Err(e) => tracing::warn!(
