@@ -84,6 +84,7 @@ pub mod host;
 mod lower;
 #[cfg(all(test, windows))]
 mod mesh_compute_tests;
+mod mesh_vs;
 mod sampler;
 mod shader;
 #[cfg(windows)]
@@ -228,12 +229,28 @@ impl MeshLayout {
     }
 }
 
+/// A mesh program for hosts without mesh shaders: the compute shader that
+/// runs it, and the vertex shader that draws what it wrote.
+///
+/// To draw `groups` groups: dispatch [`compute`](Self::compute) with
+/// `(groups, 1, 1)` and the `u0`-`u2` buffers of [`MeshLayout::bytes`];
+/// then, with `u0` bound as the root SRV `t0` in [`MESH_OUT_SPACE`] and `u1`
+/// as a 32-bit index buffer, draw [`vertex`](Self::vertex) with the title's
+/// pixel shader, `3 * max_primitives * groups` indices as a triangle list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshFallback {
+    pub compute: HostShader,
+    /// None while the program has per-primitive outputs: a vertex shader
+    /// cannot pass them on.
+    // shortcut: per-primitive outputs (`u2`) are written but not drawn.
+    pub vertex: Option<HostShader>,
+    pub layout: MeshLayout,
+}
+
 /// Translates the mesh program of a console shader container as a compute
-/// shader that writes its vertices and triangles to buffers (see
-/// [`MeshLayout`]), for hosts without mesh shaders.
-pub fn translate_mesh_as_compute(
-    container: &[u8],
-) -> Result<(HostShader, MeshLayout), ShaderError> {
+/// shader that writes its vertices and triangles to buffers, and the
+/// vertex shader that draws them ([`MeshFallback`]).
+pub fn translate_mesh_as_compute(container: &[u8]) -> Result<MeshFallback, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -261,22 +278,40 @@ pub fn emit_mesh_as_compute(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
-) -> Result<(HostShader, MeshLayout), ShaderError> {
+) -> Result<MeshFallback, ShaderError> {
     let crate::native::StageIo::Ms(ms) = &native.io else {
         return Err(ShaderError::Unsupported {
             offset: 0,
             what: "a mesh program run as compute that is no mesh program",
         });
     };
-    let (shader, outputs, prims) = emit_with(c, native, p, st, io, res, true)?;
+    let (compute, outputs, prims) = emit_with(c, native, p, st, io, res, true)?;
     let layout = MeshLayout {
         threads: ms.threads,
         max_vertices: ms.max_vertices,
         max_primitives: ms.max_primitives,
-        vertex_dwords: 4 * outputs as u32,
+        vertex_dwords: 4 * outputs.len() as u32,
         primitive_dwords: 4 * prims as u32,
     };
-    Ok((shader, layout))
+    let vertex = (prims == 0).then(|| fallback_vertex_shader(&outputs, &layout));
+    Ok(MeshFallback {
+        compute,
+        vertex,
+        layout,
+    })
+}
+
+/// The vertex shader of a [`MeshFallback`].
+fn fallback_vertex_shader(outputs: &[container::SigElement], layout: &MeshLayout) -> HostShader {
+    HostShader {
+        stage: HwStage::Vs,
+        dxil: mesh_vs::vertex_shader(outputs, layout.vertex_dwords),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+    }
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -317,8 +352,8 @@ pub fn emit(
     emit_with(c, native, p, st, io, res, false).map(|e| e.0)
 }
 
-/// [`emit`], or a mesh program as compute: the shader, and the counts of
-/// output and per-primitive signature elements.
+/// [`emit`], or a mesh program as compute: the shader, the output signature
+/// it was lowered with and the count of per-primitive elements.
 fn emit_with(
     c: &Container,
     native: &NativeProgram,
@@ -327,7 +362,7 @@ fn emit_with(
     io: &io::Io,
     res: &resource::Resources,
     mesh_as_compute: bool,
-) -> Result<(HostShader, usize, usize), ShaderError> {
+) -> Result<(HostShader, Vec<container::SigElement>, usize), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -383,7 +418,7 @@ fn emit_with(
         }
         _ => 0,
     };
-    let counts = (outputs.len(), prims.len());
+    let (kept, prim_count) = (outputs.clone(), prims.len());
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -416,7 +451,7 @@ fn emit_with(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
     };
-    Ok((shader, counts.0, counts.1))
+    Ok((shader, kept, prim_count))
 }
 
 /// The rows of an `ISG1`/`OSG1` part.

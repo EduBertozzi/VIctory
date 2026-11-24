@@ -64,6 +64,10 @@ pub(crate) struct Shader {
     pub mesh_as_compute: bool,
     /// Handles of the [`MESH_OUT_SPACE`] UAVs, by register.
     mesh_out: [Option<V>; 3],
+    /// The handle of `t0` in [`MESH_OUT_SPACE`]: the vertex records a mesh
+    /// program run as compute wrote, read by the vertex shader that draws
+    /// them.
+    mesh_vertices: Option<V>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -124,6 +128,7 @@ impl Shader {
             mesh: None,
             mesh_as_compute: false,
             mesh_out: [None; 3],
+            mesh_vertices: None,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
@@ -269,6 +274,31 @@ impl Shader {
         h
     }
 
+    /// The handle of the mesh vertex records, `t0` in [`MESH_OUT_SPACE`] (a
+    /// raw buffer), made in the entry block.
+    pub fn mesh_vertices_handle(&mut self) -> V {
+        if let Some(h) = self.mesh_vertices {
+            return h;
+        }
+        let r = self.m.i32(0);
+        let bind = [r, r, self.m.i32(MESH_OUT_SPACE), self.m.i8(0)]; // SRV
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.mesh_vertices = Some(h);
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -351,6 +381,7 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || self.mesh_out.iter().any(Option::is_some)
+            || self.mesh_vertices.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -405,20 +436,29 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
+            // Raw buffer SRVs: (space, register).
+            let mut raw: Vec<(u32, u32)> = self
+                .root_srvs
+                .iter()
+                .map(|r| (ROOT_CBV_SPACE, u32::from(r.0)))
+                .collect();
+            if self.mesh_vertices.is_some() {
+                raw.push((MESH_OUT_SPACE, 0));
+            }
+            if !raw.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                for (n, (space, register)) in raw.into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, register)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(i32c(&mut self, 0)),
@@ -427,8 +467,8 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register,
                         dxil_kind: 11,
                     });
                 }

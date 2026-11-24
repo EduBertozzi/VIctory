@@ -1,21 +1,25 @@
 //! A mesh program run as compute ([`super::translate_mesh_as_compute`]):
-//! a synthetic GFX10 mesh program lowered both ways, and the compute form
-//! dispatched on the host GPU (and WARP) to read back what it wrote.
+//! a synthetic GFX10 mesh program lowered both ways; the compute form
+//! dispatched to read back what it wrote, and drawn with the fallback
+//! vertex shader to compare with the mesh shader's own image.
 
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::Interface;
 
+use super::bitcode::{Attr, Term};
 use super::container::SigElement;
 use super::host::Host;
-use super::{HostShader, MESH_OUT_SPACE, MeshLayout, lower, validator};
+use super::shader::Shader;
+use super::{HostShader, MESH_OUT_SPACE, MeshLayout, lower, mesh_vs, validator};
 use crate::native::{HwStage, MeshIo, NativeProgram, StageIo, Usage, VsOutput};
 use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 /// Inline constants as operands.
 const ZERO: u16 = 0x80;
+const ONE: u16 = 0x81;
 const MINUS_ONE: u16 = 0xC1;
 const ONE_F: u16 = 0xF2;
 const TWO_F: u16 = 0xF4;
@@ -66,8 +70,8 @@ const fn vgpr(n: u8) -> u16 {
 }
 
 /// One triangle per group from three lanes. Lane n exports vertex n at
-/// (n, 2, 0, 1) with `TEXCOORD0` (n, 1, 2, 0), and primitive n: lane 0
-/// the triangle (0, 1, 2), lanes 1 and 2 culled ones.
+/// (n - 1, 2 (n & 1) - 1, 0, 1) with `TEXCOORD0` (n, 1, 2, 0), and
+/// primitive n: lane 0 the triangle (0, 1, 2), lanes 1 and 2 culled ones.
 fn program() -> NativeProgram {
     let mut w = Vec::new();
     w.extend(vop3(0x365, 0, MINUS_ONE, ZERO, 0)); // v_mbcnt_lo_u32_b32 v0, -1, 0: the lane
@@ -75,6 +79,11 @@ fn program() -> NativeProgram {
     w.push(vop1(0x001, 2, TWO_F)); // v_mov_b32 v2, 2.0
     w.push(vop1(0x001, 3, ZERO)); // v_mov_b32 v3, 0
     w.push(vop1(0x001, 4, ONE_F)); // v_mov_b32 v4, 1.0
+    w.push(vop2(0x05, 7, ONE_F, 1)); // v_subrev_f32 v7, 1.0, v1: x
+    w.push(vop2(0x1b, 8, ONE, 0)); // v_and_b32 v8, 1, v0
+    w.push(vop1(0x006, 8, vgpr(8))); // v_cvt_f32_u32 v8, v8
+    w.push(vop2(0x08, 8, TWO_F, 8)); // v_mul_f32 v8, 2.0, v8
+    w.push(vop2(0x05, 8, ONE_F, 8)); // v_subrev_f32 v8, 1.0, v8: y
     // v6 = 0x00200400 + lane * 0x7FDFFC00: lane 0 the indices 0, 1, 2;
     // lanes 1 and 2 have bit 31 set (culled).
     w.extend([s_mov_b32(10, LITERAL), 0x7FDF_FC00]);
@@ -83,12 +92,12 @@ fn program() -> NativeProgram {
     w.push(vop2(0x25, 6, 11, 6)); // v_add_nc_u32 v6, s11, v6
     w.extend(exp(20, [Some(6), None, None, None], true)); // exp prim
     w.extend(exp(32, [Some(1), Some(4), Some(2), Some(3)], false)); // exp param0
-    w.extend(exp(12, [Some(1), Some(2), Some(3), Some(4)], true)); // exp pos0
+    w.extend(exp(12, [Some(7), Some(8), Some(3), Some(4)], true)); // exp pos0
     w.push(S_ENDPGM);
     NativeProgram {
         stage: HwStage::Ms,
         wave64: false,
-        vgprs: 8,
+        vgprs: 12,
         layout: vec![],
         used: vec![],
         io: StageIo::Ms(MeshIo {
@@ -129,6 +138,25 @@ fn outputs() -> Vec<SigElement> {
     ]
 }
 
+fn validate(shader: &HostShader) {
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+}
+
+fn shader(stage: HwStage, dxil: Vec<u8>) -> HostShader {
+    HostShader {
+        stage,
+        dxil,
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+    }
+}
+
 /// The program lowered as a mesh shader or, with `as_compute`, a compute
 /// shader with its layout; validated when `dxil.dll` is there.
 fn lowered(as_compute: bool) -> (HostShader, MeshLayout) {
@@ -151,19 +179,8 @@ fn lowered(as_compute: bool) -> (HostShader, MeshLayout) {
         mesh_as_compute: as_compute,
     })
     .expect("lower");
-    let shader = HostShader {
-        stage: HwStage::Ms,
-        dxil: l.dxil,
-        user_data: l.user_data,
-        samplers: l.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: l.root_cbvs,
-        root_srvs: l.root_srvs,
-    };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        let mut copy = shader.dxil.clone();
-        v.validate(&mut copy).expect("DXIL validation failed");
-    }
+    let s = shader(HwStage::Ms, l.dxil);
+    validate(&s);
     let layout = MeshLayout {
         threads: 3,
         max_vertices: 3,
@@ -171,10 +188,52 @@ fn lowered(as_compute: bool) -> (HostShader, MeshLayout) {
         vertex_dwords: 4 * outputs.len() as u32,
         primitive_dwords: 0,
     };
-    (shader, layout)
+    (s, layout)
 }
 
-/// The program kind in the DXIL part's version word (5 compute, 13 mesh).
+/// The fallback's vertex shader for the program.
+fn fallback_vs(layout: &MeshLayout) -> HostShader {
+    let vs = shader(
+        HwStage::Vs,
+        mesh_vs::vertex_shader(&outputs(), layout.vertex_dwords),
+    );
+    validate(&vs);
+    vs
+}
+
+/// A pixel shader writing `TEXCOORD0` to target 0.
+fn texcoord_ps() -> HostShader {
+    let mut s = Shader::new(true);
+    let mut inputs = outputs();
+    inputs[1].usage = 0xF;
+    s.inputs = inputs;
+    let e = s.entry;
+    for col in 0..4u8 {
+        let args = [s.m.i32(1), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+        let x = s.op(e, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), x];
+        s.op(e, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+    }
+    s.outputs = vec![SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    }];
+    s.m.terminate(e, Term::Ret);
+    let ps = shader(HwStage::Ps, s.finish());
+    validate(&ps);
+    ps
+}
+
+/// The program kind in the DXIL part's version word (1 vertex, 5 compute,
+/// 13 mesh).
 fn program_kind(container: &[u8]) -> u32 {
     let c = crate::dxbc::Container::parse(container).expect("container");
     let dxil = c.part(crate::dxbc::FourCC::DXIL).expect("DXIL part");
@@ -187,159 +246,292 @@ fn a_mesh_program_lowers_as_compute_too() {
     let (cs, layout) = lowered(true);
     assert_eq!(program_kind(&mesh.dxil), 13);
     assert_eq!(program_kind(&cs.dxil), 5);
+    assert_eq!(program_kind(&fallback_vs(&layout).dxil), 1);
     assert_eq!(layout.bytes(2), [2 * 3 * 8 * 4, 2 * 3 * 12, 0]);
 }
 
-/// Runs the compute form for `groups` groups and returns `u0` and `u1`.
-fn run(
-    host: &Host,
-    cs: &HostShader,
-    layout: &MeshLayout,
-    groups: u32,
-) -> Result<[Vec<u32>; 2], String> {
-    let err = |e: windows::core::Error| e.message().to_string();
-    let dev = &host.device;
-    let sizes = layout.bytes(groups).map(|b| b.max(4));
-    let params: Vec<D3D12_ROOT_PARAMETER1> = (0..3)
-        .map(|r| D3D12_ROOT_PARAMETER1 {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+/// D3D12 plumbing for the tests: one device, its queue, and helpers.
+struct Gpu<'a> {
+    dev: &'a ID3D12Device,
+    queue: ID3D12CommandQueue,
+    root: ID3D12RootSignature,
+}
+
+fn err(e: windows::core::Error) -> String {
+    e.message().to_string()
+}
+
+fn transition(
+    r: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                // SAFETY: a borrowed pointer; the barrier never releases it.
+                pResource: unsafe { std::mem::transmute_copy(r) },
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: before,
+                StateAfter: after,
+            }),
+        },
+    }
+}
+
+const SIZE: u32 = 32;
+/// Root parameters: `u0`-`u2` (0-2) and `t0` (3) in [`MESH_OUT_SPACE`].
+const VERTICES_SRV: u32 = 3;
+
+impl<'a> Gpu<'a> {
+    fn new(host: &'a Host) -> Result<Self, String> {
+        let dev = &host.device;
+        let mut params: Vec<D3D12_ROOT_PARAMETER1> = (0..3)
+            .map(|r| D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: r,
+                        RegisterSpace: MESH_OUT_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            })
+            .collect();
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
             Anonymous: D3D12_ROOT_PARAMETER1_0 {
                 Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                    ShaderRegister: r,
+                    ShaderRegister: 0,
                     RegisterSpace: MESH_OUT_SPACE,
                     Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                 },
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        })
-        .collect();
-    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
-        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
-        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
-            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
-                NumParameters: params.len() as u32,
-                pParameters: params.as_ptr(),
-                Flags: D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
-                ..Default::default()
+        });
+        let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                    NumParameters: params.len() as u32,
+                    pParameters: params.as_ptr(),
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+                        | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+                        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                    ..Default::default()
+                },
             },
-        },
-    };
-    // SAFETY: D3D12 calls with descriptions that outlive them; the resources
-    // stay alive until the fence says the GPU is done.
-    unsafe {
-        let mut blob = None;
-        D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).map_err(err)?;
-        let blob: ID3DBlob = blob.ok_or("no root signature blob")?;
-        let bytes =
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        let root: ID3D12RootSignature = dev.CreateRootSignature(0, bytes).map_err(err)?;
-        let pso = host.compute_pipeline_with(&root, &cs.dxil)?;
-        let buffer = |heap, size: u64, flags, state| -> Result<ID3D12Resource, String> {
-            let mut r: Option<ID3D12Resource> = None;
-            dev.CreateCommittedResource(
-                &D3D12_HEAP_PROPERTIES {
-                    Type: heap,
-                    ..Default::default()
-                },
-                D3D12_HEAP_FLAG_NONE,
-                &D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: size,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    Format: DXGI_FORMAT_UNKNOWN,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    Flags: flags,
-                    ..Default::default()
-                },
-                state,
-                None,
-                &mut r,
-            )
-            .map_err(err)?;
-            r.ok_or_else(|| "no resource".to_string())
         };
-        let mut outs = Vec::new();
-        let mut readbacks = Vec::new();
-        for &size in &sizes {
-            outs.push(buffer(
-                D3D12_HEAP_TYPE_DEFAULT,
-                size,
-                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            )?);
-            readbacks.push(buffer(
-                D3D12_HEAP_TYPE_READBACK,
-                size,
-                D3D12_RESOURCE_FLAG_NONE,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-            )?);
-        }
-        let queue: ID3D12CommandQueue = dev
-            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                ..Default::default()
+        // SAFETY: plain D3D12 calls with descriptions that outlive them.
+        unsafe {
+            let mut blob = None;
+            D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).map_err(err)?;
+            let blob: ID3DBlob = blob.ok_or("no root signature blob")?;
+            let bytes = std::slice::from_raw_parts(
+                blob.GetBufferPointer().cast::<u8>(),
+                blob.GetBufferSize(),
+            );
+            Ok(Gpu {
+                dev,
+                queue: dev
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        ..Default::default()
+                    })
+                    .map_err(err)?,
+                root: dev.CreateRootSignature(0, bytes).map_err(err)?,
             })
-            .map_err(err)?;
-        let alloc: ID3D12CommandAllocator = dev
-            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-            .map_err(err)?;
-        let list: ID3D12GraphicsCommandList = dev
-            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso)
-            .map_err(err)?;
-        list.SetComputeRootSignature(&root);
-        for (k, out) in outs.iter().enumerate() {
-            list.SetComputeRootUnorderedAccessView(k as u32, out.GetGPUVirtualAddress());
         }
-        list.Dispatch(groups, 1, 1);
-        for (out, readback) in outs.iter().zip(&readbacks) {
-            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                        pResource: std::mem::transmute_copy(out),
-                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                        StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    }),
-                },
-            }]);
-            list.CopyResource(readback, out);
+    }
+
+    fn resource(
+        &self,
+        heap: D3D12_HEAP_TYPE,
+        desc: &D3D12_RESOURCE_DESC,
+        state: D3D12_RESOURCE_STATES,
+        clear: Option<&D3D12_CLEAR_VALUE>,
+    ) -> Result<ID3D12Resource, String> {
+        let mut r: Option<ID3D12Resource> = None;
+        // SAFETY: a plain D3D12 call with a live description.
+        unsafe {
+            self.dev
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: heap,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    desc,
+                    state,
+                    clear.map(std::ptr::from_ref),
+                    &mut r,
+                )
+                .map_err(err)?;
         }
-        list.Close().map_err(err)?;
-        queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
-        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-        queue.Signal(&fence, 1).map_err(err)?;
-        while fence.GetCompletedValue() < 1 {
-            if let Err(e) = dev.GetDeviceRemovedReason() {
-                return Err(format!("device removed: {}", err(e)));
+        r.ok_or_else(|| "no resource".to_string())
+    }
+
+    fn buffer(
+        &self,
+        heap: D3D12_HEAP_TYPE,
+        size: u64,
+        flags: D3D12_RESOURCE_FLAGS,
+        state: D3D12_RESOURCE_STATES,
+    ) -> Result<ID3D12Resource, String> {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(4),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_UNKNOWN,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        self.resource(heap, &desc, state, None)
+    }
+
+    /// A fresh command list (with no pipeline set).
+    fn list(&self) -> Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList6), String> {
+        // SAFETY: plain D3D12 calls.
+        unsafe {
+            let alloc: ID3D12CommandAllocator = self
+                .dev
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .map_err(err)?;
+            let list: ID3D12GraphicsCommandList = self
+                .dev
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                .map_err(err)?;
+            Ok((alloc, list.cast().map_err(err)?))
+        }
+    }
+
+    /// Closes `list`, runs it and waits for the GPU.
+    fn run(&self, list: &ID3D12GraphicsCommandList6) -> Result<(), String> {
+        // SAFETY: plain D3D12 calls; the caller keeps the resources alive.
+        unsafe {
+            list.Close().map_err(err)?;
+            self.queue
+                .ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
+            let fence: ID3D12Fence = self
+                .dev
+                .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                .map_err(err)?;
+            self.queue.Signal(&fence, 1).map_err(err)?;
+            while fence.GetCompletedValue() < 1 {
+                if let Err(e) = self.dev.GetDeviceRemovedReason() {
+                    return Err(format!("device removed: {}", err(e)));
+                }
+                std::thread::yield_now();
             }
-            std::thread::yield_now();
         }
-        let read = |r: &ID3D12Resource, size: u64| -> Result<Vec<u32>, String> {
+        Ok(())
+    }
+
+    fn read(r: &ID3D12Resource, dwords: usize) -> Result<Vec<u32>, String> {
+        // SAFETY: a mapped readback buffer of at least `dwords` dwords.
+        unsafe {
             let mut p = std::ptr::null_mut();
             r.Map(0, None, Some(&mut p)).map_err(err)?;
-            let v = std::slice::from_raw_parts(p.cast::<u32>(), size as usize / 4).to_vec();
+            let v = std::slice::from_raw_parts(p.cast::<u32>(), dwords).to_vec();
             r.Unmap(0, None);
             Ok(v)
-        };
-        Ok([
-            read(&readbacks[0], sizes[0])?,
-            read(&readbacks[1], sizes[1])?,
-        ])
+        }
     }
+
+    /// The three mesh output buffers, in UNORDERED_ACCESS.
+    fn mesh_buffers(
+        &self,
+        layout: &MeshLayout,
+        groups: u32,
+    ) -> Result<Vec<ID3D12Resource>, String> {
+        layout
+            .bytes(groups)
+            .into_iter()
+            .map(|size| {
+                self.buffer(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    size,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )
+            })
+            .collect()
+    }
+
+    /// Records the compute pass writing `outs`.
+    fn record_compute(
+        &self,
+        list: &ID3D12GraphicsCommandList6,
+        pso: &ID3D12PipelineState,
+        outs: &[ID3D12Resource],
+        groups: u32,
+    ) {
+        // SAFETY: plain D3D12 recording; the caller keeps the objects alive.
+        unsafe {
+            list.SetPipelineState(pso);
+            list.SetComputeRootSignature(&self.root);
+            for (k, out) in outs.iter().enumerate() {
+                list.SetComputeRootUnorderedAccessView(k as u32, out.GetGPUVirtualAddress());
+            }
+            list.Dispatch(groups, 1, 1);
+        }
+    }
+}
+
+/// Runs the compute form for `groups` groups and returns `u0` and `u1`.
+fn run_compute(
+    host: &Host,
+    cs: &HostShader,
+    layout: &MeshLayout,
+    groups: u32,
+) -> Result<[Vec<u32>; 2], String> {
+    let gpu = Gpu::new(host)?;
+    let pso = host.compute_pipeline_with(&gpu.root, &cs.dxil)?;
+    let outs = gpu.mesh_buffers(layout, groups)?;
+    let sizes = layout.bytes(groups);
+    let readbacks: Vec<ID3D12Resource> = sizes
+        .iter()
+        .map(|&s| {
+            gpu.buffer(
+                D3D12_HEAP_TYPE_READBACK,
+                s,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )
+        })
+        .collect::<Result<_, _>>()?;
+    let (_alloc, list) = gpu.list()?;
+    gpu.record_compute(&list, &pso, &outs, groups);
+    // SAFETY: plain D3D12 recording of live resources.
+    unsafe {
+        for (out, readback) in outs.iter().zip(&readbacks) {
+            list.ResourceBarrier(&[transition(
+                out,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.CopyResource(readback, out);
+        }
+    }
+    gpu.run(&list)?;
+    Ok([
+        Gpu::read(&readbacks[0], sizes[0] as usize / 4)?,
+        Gpu::read(&readbacks[1], sizes[1] as usize / 4)?,
+    ])
 }
 
 #[test]
 fn a_mesh_program_run_as_compute_writes_its_vertices_and_triangles() {
-    // One test at a time on the devices (see `valu_tests::run_cases`).
     let (cs, layout) = lowered(true);
     let groups = 2;
     let mut ran = 0;
@@ -349,15 +541,16 @@ fn a_mesh_program_run_as_compute_writes_its_vertices_and_triangles() {
             continue;
         };
         let [vertices, indices] =
-            run(&host, &cs, &layout, groups).unwrap_or_else(|e| panic!("{label}: {e}"));
+            run_compute(&host, &cs, &layout, groups).unwrap_or_else(|e| panic!("{label}: {e}"));
         let f = f32::to_bits;
         let mut want_vertices = Vec::new();
         let mut want_indices = Vec::new();
         for g in 0..groups {
             for lane in 0..3u32 {
                 let n = lane as f32;
+                let y = 2.0 * (lane & 1) as f32 - 1.0;
                 // SV_Position, then TEXCOORD0.
-                want_vertices.extend([f(n), f(2.0), f(0.0), f(1.0)]);
+                want_vertices.extend([f(n - 1.0), f(y), f(0.0), f(1.0)]);
                 want_vertices.extend([f(n), f(1.0), f(2.0), f(0.0)]);
                 want_indices.extend(match lane {
                     0 => [3 * g, 3 * g + 1, 3 * g + 2],
@@ -370,4 +563,252 @@ fn a_mesh_program_run_as_compute_writes_its_vertices_and_triangles() {
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// How [`render`] draws the program.
+enum Draw<'a> {
+    /// As a mesh shader.
+    Mesh(&'a HostShader),
+    /// Run as compute, then drawn by the fallback vertex shader.
+    Fallback {
+        cs: &'a HostShader,
+        vs: &'a HostShader,
+        layout: &'a MeshLayout,
+    },
+}
+
+fn has_mesh_shaders(host: &Host) -> bool {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    // SAFETY: a feature query with a matching out structure.
+    let ok = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS7,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    };
+    ok.is_ok() && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+}
+
+/// Draws `groups` groups of the program with `ps` into a [`SIZE`]² RGBA32F
+/// target cleared to -1, and returns its texels row by row.
+fn render(host: &Host, draw: &Draw, ps: &HostShader, groups: u32) -> Result<Vec<[f32; 4]>, String> {
+    let gpu = Gpu::new(host)?;
+    let dev = gpu.dev;
+    let format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let clear = D3D12_CLEAR_VALUE {
+        Format: format,
+        Anonymous: D3D12_CLEAR_VALUE_0 { Color: [-1.0; 4] },
+    };
+    let target = gpu.resource(
+        D3D12_HEAP_TYPE_DEFAULT,
+        &D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(SIZE),
+            Height: SIZE,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        },
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        Some(&clear),
+    )?;
+    let pitch = SIZE * 16;
+    let readback = gpu.buffer(
+        D3D12_HEAP_TYPE_READBACK,
+        u64::from(pitch * SIZE),
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    )?;
+    let (_alloc, list) = gpu.list()?;
+    let mut keep: Vec<ID3D12PipelineState> = Vec::new();
+    let mut keep_buffers: Vec<ID3D12Resource> = Vec::new();
+    // SAFETY: D3D12 calls with descriptions that outlive them; every object
+    // stays alive (`keep`, `keep_buffers`) until `run` has waited for the GPU.
+    unsafe {
+        let rtvs: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                NumDescriptors: 1,
+                ..Default::default()
+            })
+            .map_err(err)?;
+        let rtv = rtvs.GetCPUDescriptorHandleForHeapStart();
+        dev.CreateRenderTargetView(&target, None, rtv);
+        let draw_pso = match *draw {
+            Draw::Mesh(ms) => host.mesh_pipeline_with(&gpu.root, &ms.dxil, &ps.dxil)?,
+            Draw::Fallback { cs, vs, layout } => {
+                let cs_pso = host.compute_pipeline_with(&gpu.root, &cs.dxil)?;
+                let outs = gpu.mesh_buffers(layout, groups)?;
+                gpu.record_compute(&list, &cs_pso, &outs, groups);
+                list.ResourceBarrier(&[
+                    transition(
+                        &outs[0],
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    ),
+                    transition(
+                        &outs[1],
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_INDEX_BUFFER,
+                    ),
+                ]);
+                list.SetGraphicsRootSignature(&gpu.root);
+                list.SetGraphicsRootShaderResourceView(
+                    VERTICES_SRV,
+                    outs[0].GetGPUVirtualAddress(),
+                );
+                list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                    BufferLocation: outs[1].GetGPUVirtualAddress(),
+                    SizeInBytes: layout.bytes(groups)[1] as u32,
+                    Format: DXGI_FORMAT_R32_UINT,
+                }));
+                list.IASetPrimitiveTopology(
+                    windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                );
+                keep.push(cs_pso);
+                keep_buffers.extend(outs);
+                host.pipeline_with(&gpu.root, &vs.dxil, &ps.dxil)?
+            }
+        };
+        list.SetPipelineState(&draw_pso);
+        list.SetGraphicsRootSignature(&gpu.root);
+        list.ClearRenderTargetView(rtv, &[-1.0; 4], None);
+        list.OMSetRenderTargets(1, Some(&rtv), false, None);
+        list.RSSetViewports(&[D3D12_VIEWPORT {
+            Width: SIZE as f32,
+            Height: SIZE as f32,
+            MaxDepth: 1.0,
+            ..Default::default()
+        }]);
+        list.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+            right: SIZE as i32,
+            bottom: SIZE as i32,
+            ..Default::default()
+        }]);
+        match *draw {
+            Draw::Mesh(_) => list.DispatchMesh(groups, 1, 1),
+            Draw::Fallback { layout, .. } => {
+                list.DrawIndexedInstanced(3 * layout.max_primitives * groups, 1, 0, 0, 0);
+            }
+        }
+        list.ResourceBarrier(&[transition(
+            &target,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+        let dst = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&readback),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: format,
+                        Width: SIZE,
+                        Height: SIZE,
+                        Depth: 1,
+                        RowPitch: pitch,
+                    },
+                },
+            },
+        };
+        let src = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&target),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        gpu.run(&list)?;
+        drop(draw_pso);
+    }
+    drop((keep, keep_buffers));
+    let words = Gpu::read(&readback, (pitch * SIZE / 4) as usize)?;
+    Ok(words
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|t| t.map(f32::from_bits))
+        .collect())
+}
+
+/// Whether two images cover the same texels and agree within `tolerance`.
+fn same_image(a: &[[f32; 4]], b: &[[f32; 4]], tolerance: f32) -> Result<(), String> {
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        let (covered_a, covered_b) = (x[1] != -1.0, y[1] != -1.0);
+        if covered_a != covered_b || x.iter().zip(y).any(|(p, q)| (p - q).abs() > tolerance) {
+            return Err(format!(
+                "texel ({}, {}): {x:?} and {y:?}",
+                i as u32 % SIZE,
+                i as u32 / SIZE
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_mesh_program_run_as_compute_draws_what_the_mesh_shader_draws() {
+    let (ms, _) = lowered(false);
+    let (cs, layout) = lowered(true);
+    let vs = fallback_vs(&layout);
+    let ps = texcoord_ps();
+    let fallback = Draw::Fallback {
+        cs: &cs,
+        vs: &vs,
+        layout: &layout,
+    };
+    let groups = 2;
+    let mut reference = None;
+    let mut images = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        if has_mesh_shaders(&host) && reference.is_none() {
+            let native = render(&host, &Draw::Mesh(&ms), &ps, groups)
+                .unwrap_or_else(|e| panic!("{label} mesh: {e}"));
+            reference = Some((label, native));
+        } else {
+            eprintln!("{label}: no mesh shaders; the fallback only");
+        }
+        let image = render(&host, &fallback, &ps, groups)
+            .unwrap_or_else(|e| panic!("{label} fallback: {e}"));
+        // The triangle covers about a quarter of the target, with
+        // TEXCOORD0.y = 1 wherever it is drawn.
+        let covered: Vec<_> = image.iter().filter(|t| t[1] != -1.0).collect();
+        assert!(
+            covered.len() > (SIZE * SIZE / 5) as usize,
+            "{label}: {} texels",
+            covered.len()
+        );
+        assert!(
+            covered.iter().all(|t| t[1] == 1.0 && t[2] == 2.0),
+            "{label}"
+        );
+        images.push((label, image));
+    }
+    assert!(
+        !images.is_empty(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
+    let Some((ref_label, native)) = reference else {
+        panic!("no device with mesh shaders to compare with");
+    };
+    for (label, image) in &images {
+        // The same device rasterizes both the same way; another device may
+        // interpolate a little differently.
+        let tolerance = if *label == ref_label { 1e-6 } else { 1e-3 };
+        same_image(&native, image, tolerance)
+            .unwrap_or_else(|e| panic!("{ref_label} mesh vs {label} fallback: {e}"));
+    }
 }
