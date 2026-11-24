@@ -699,6 +699,129 @@ impl State {
         drawn
     }
 
+    /// An indirect mesh dispatch with a pipeline drawn without mesh shaders
+    /// ([`crate::mesh_indirect`]): `records` clamped records `stride` bytes
+    /// apart at host address `args` (and their count at `count`), both in
+    /// UNORDERED_ACCESS. False if it cannot run.
+    fn indirect_mesh_fallback(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        f: &crate::pipeline::host::MeshFallback,
+        (args, stride, records): (u64, u32, u32),
+        count: Option<u64>,
+    ) -> bool {
+        use crate::host::transition;
+        use crate::mesh_indirect::{COMPUTE_STRIDE, draw_stride};
+        let (Some(signatures), Some(convert)) = (&f.signatures, crate::mesh_indirect::convert())
+        else {
+            once!("indirect mesh dispatches without mesh shaders dropped");
+            return false;
+        };
+        if records == 0 {
+            return true;
+        }
+        let regions = crate::mesh_indirect::regions(&f.layout);
+        let draws = (u64::from(records) * u64::from(COMPUTE_STRIDE)).next_multiple_of(256);
+        let commands_len = draws + u64::from(records) * u64::from(draw_stride(f.expanded));
+        let (Ok(draws32), Ok(index_bytes)) =
+            (u32::try_from(draws), u32::try_from(regions.index_bytes))
+        else {
+            once!(
+                records,
+                "an indirect mesh dispatch too large for the fallback"
+            );
+            return false;
+        };
+        let (Some(data), Some(commands)) = (
+            list.mesh_scratch(regions.bytes),
+            list.mesh_scratch(commands_len),
+        ) else {
+            return false;
+        };
+        list.keep(&data);
+        list.keep(&commands);
+        let l = &list.list;
+        // SAFETY: an open list; the buffers live until the list is reset.
+        let (base, commands_gpu) =
+            unsafe { (data.GetGPUVirtualAddress(), commands.GetGPUVirtualAddress()) };
+        let plan = crate::mesh_indirect::plan(
+            (records, stride, count.is_some()),
+            &f.layout,
+            &regions,
+            f.expanded,
+            base,
+            draws32,
+        );
+        let read =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER;
+        let (common, uav, argument) = (
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        );
+        // Both buffers serve this one execution of the list: COMMON at both
+        // ends. The pass reads the records the clamp just wrote.
+        // SAFETY: an open list and live buffers.
+        unsafe {
+            l.ResourceBarrier(&[
+                transition(&data, common, uav),
+                transition(&commands, common, uav),
+            ]);
+        }
+        crate::mesh_indirect::record(l, convert, &plan, args, count, commands_gpu);
+        // SAFETY: an open list and a live buffer.
+        unsafe { l.ResourceBarrier(&[transition(&commands, uav, argument)]) };
+        // The pass replaced the compute root signature and pipeline.
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+        let mut drawn = false;
+        if self.bind_as(list, p, &f.compute, &p.stages[..1], false, true) {
+            // SAFETY: an open list with the compute pass bound and the
+            // commands in INDIRECT_ARGUMENT.
+            unsafe {
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text(format!("indirect mesh {records} as compute"), false));
+                l.ExecuteIndirect(&signatures.compute, records, &commands, 0, None, 0);
+                l.ResourceBarrier(&[transition(&data, uav, read)]);
+            }
+            drawn = self.prepare_for(list, false, true);
+            if drawn {
+                // SAFETY: an open list with the draw bound.
+                unsafe {
+                    // t0 changes per command; t1 and t2 are the regions'.
+                    for (param, at) in f
+                        .inputs
+                        .into_iter()
+                        .zip([0, regions.indices, regions.prims])
+                    {
+                        l.SetGraphicsRootShaderResourceView(param, base + at);
+                    }
+                    l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4)); // triangle list
+                    if !f.expanded {
+                        l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                            BufferLocation: base + regions.indices,
+                            SizeInBytes: index_bytes,
+                            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                        }));
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    list.note_op(|| self.op_text(format!("indirect mesh {records} drawn"), false));
+                    l.ExecuteIndirect(&signatures.draw, records, &commands, draws, None, 0);
+                }
+                self.set_topology(list, self.topology);
+            }
+            // SAFETY: an open list and a live buffer.
+            unsafe { l.ResourceBarrier(&[transition(&data, read, common)]) };
+        } else {
+            // SAFETY: an open list and a live buffer.
+            unsafe { l.ResourceBarrier(&[transition(&data, uav, common)]) };
+        }
+        // SAFETY: an open list and a live buffer.
+        unsafe { l.ResourceBarrier(&[transition(&commands, argument, common)]) };
+        drawn
+    }
+
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
@@ -1143,17 +1266,25 @@ impl State {
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
+        // A mesh pipeline drawn without mesh shaders: its own pass and two
+        // executions instead (the arguments back to UAV for that pass).
+        if kind == MESH
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+            && let Some(f) = &p.fallback
+        {
+            crate::indirect::done(list, &args.buffer);
+            let count = counter.as_ref().map(|(s, at)| s.gpu(*at));
+            let ran =
+                self.indirect_mesh_fallback(list, p, f, (args.gpu(arguments), stride, max), count);
+            if ran {
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            } else {
+                why("mesh fallback could not run");
+            }
+            return ran;
+        }
         let ran = match kind {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
-            // shortcut: indirect mesh dispatches of a pipeline drawn without
-            // mesh shaders are dropped (the group count is on the GPU; the
-            // fallback would need it to size and draw its buffers).
-            MESH if crate::pipeline::host_pipeline(self.pipeline as This)
-                .is_some_and(|p| p.fallback.is_some()) =>
-            {
-                once!("indirect mesh dispatches without mesh shaders dropped");
-                false
-            }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),

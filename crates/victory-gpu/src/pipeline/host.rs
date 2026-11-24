@@ -277,6 +277,8 @@ pub(crate) struct MeshFallback {
     /// Drawn unindexed, three vertices per primitive (the program has
     /// per-primitive outputs); else indexed by `u1`.
     pub(crate) expanded: bool,
+    /// What its indirect mesh dispatches execute (none: they are dropped).
+    pub(crate) signatures: Option<crate::mesh_indirect::Signatures>,
 }
 
 pub(crate) struct HostPipeline {
@@ -606,6 +608,17 @@ impl HostPipeline {
             );
             crate::host::name(&pso, || format!("{shaders:?} fallback"));
             crate::host::name(&compute_pso, || format!("{shaders:?} fallback compute"));
+            let signatures = crate::mesh_indirect::signatures(
+                &host.device,
+                &root,
+                outputs,
+                inputs[0],
+                f.expanded,
+            );
+            if let Err(e) = &signatures {
+                tracing::warn!(error = %e, ?shaders, "no mesh fallback command signatures");
+            }
+            let signatures = signatures.ok();
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
@@ -615,6 +628,7 @@ impl HostPipeline {
                     outputs,
                     inputs,
                     expanded: f.expanded,
+                    signatures,
                 }),
                 pso,
                 root,
