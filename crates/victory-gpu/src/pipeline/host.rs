@@ -330,10 +330,11 @@ impl HostPipeline {
             );
         }
         let mesh = find("mesh");
-        // Without mesh shaders (or with `VICTORY_MESH_FALLBACK=1`) the mesh
-        // program runs as compute, so its bindings are visible to all.
+        // Without mesh shaders (or with `VICTORY_MESH_FALLBACK=1`), or when
+        // it outputs more than D3D12 allows a mesh shader, the mesh program
+        // runs as compute, so its bindings are visible to all.
         let fallback = match mesh {
-            Some(ms) if host()?.mesh_fallback() => {
+            Some(ms) if host()?.mesh_fallback() || ms.mesh_over_limit() => {
                 let Some(f) = ms.mesh_fallback() else {
                     return refuse("the mesh shader does not translate as compute", shaders);
                 };

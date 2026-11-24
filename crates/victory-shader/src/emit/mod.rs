@@ -252,6 +252,58 @@ pub struct MeshFallback {
     pub layout: MeshLayout,
 }
 
+/// D3D12's limit on what one mesh shader group outputs, in bytes
+/// (DirectX-Specs `d3d/MeshShader.md`, "Mesh shader output size limits").
+/// The compute form of a [`MeshFallback`] writes to buffers and has none.
+pub const MESH_OUTPUT_LIMIT: u32 = 32 * 1024;
+
+/// What D3D12 counts against [`MESH_OUTPUT_LIMIT`]: 4 bytes per component
+/// of every vertex output element times the vertex maximum rounded up to
+/// 32, plus the same for the primitive outputs and maximum.
+fn mesh_output_bytes_of(
+    outputs: &[container::SigElement],
+    prims: &[container::SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+) -> u32 {
+    let bytes =
+        |els: &[container::SigElement]| els.iter().map(|e| 4 * u32::from(e.cols)).sum::<u32>();
+    bytes(outputs) * max_vertices.next_multiple_of(32)
+        + bytes(prims) * max_primitives.next_multiple_of(32)
+}
+
+/// What the mesh program of a console shader container outputs per group,
+/// as D3D12 counts it against [`MESH_OUTPUT_LIMIT`], with the signatures and
+/// maxima the translation declares; `None` without a mesh program.
+pub fn mesh_output_bytes(container: &[u8]) -> Result<Option<u32>, ShaderError> {
+    let c = Container::parse(container)?;
+    let Some(dxil) = c.part(FourCC::DXIL) else {
+        return Ok(None);
+    };
+    let Some(native) = crate::native_programs(dxil.data)?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Ms)
+    else {
+        return Ok(None);
+    };
+    let crate::native::StageIo::Ms(ms) = &native.io else {
+        return Ok(None);
+    };
+    let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
+        c.part(fourcc).map_or(Ok(Vec::new()), |p| signature(p.data))
+    };
+    let outputs = sig(FourCC::OSG1)?;
+    // As `emit` declares them: without the primitive id and cull flag.
+    let mut prims = sig(FourCC::PSG1)?;
+    prims.retain(|e| !matches!(e.kind, 10 | 30));
+    Ok(Some(mesh_output_bytes_of(
+        &outputs,
+        &prims,
+        ms.max_vertices,
+        ms.max_primitives,
+    )))
+}
+
 /// Translates the mesh program of a console shader container as a compute
 /// shader that writes its vertices and triangles to buffers, and the
 /// vertex shader that draws them ([`MeshFallback`]).
@@ -907,5 +959,48 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    /// D3D12's mesh output size: 4 bytes per component of every element,
+    /// times the maxima rounded up to 32.
+    #[test]
+    fn mesh_output_size_counts_components_and_rounds_maxima_up_to_32() {
+        let el = |kind, cols| SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: None,
+            col: 0,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        // One float4 position per vertex, 64 vertices: 16 * 64.
+        assert_eq!(mesh_output_bytes_of(&[el(3, 4)], &[], 64, 0), 1024);
+        // 33 vertices count as 64, 1 as 32.
+        assert_eq!(mesh_output_bytes_of(&[el(3, 4)], &[], 33, 0), 1024);
+        assert_eq!(mesh_output_bytes_of(&[el(3, 4)], &[], 1, 0), 512);
+        // A float2 is 8 bytes, not a row's 16.
+        assert_eq!(mesh_output_bytes_of(&[el(0, 2)], &[], 32, 0), 256);
+        // Primitive outputs count against the primitive maximum.
+        assert_eq!(
+            mesh_output_bytes_of(&[el(3, 4)], &[el(0, 1)], 32, 126),
+            512 + 4 * 128
+        );
+        // 8 float4s for 256 vertices is exactly the limit; one more
+        // component is over it.
+        let at = vec![el(0, 4); 8];
+        assert_eq!(mesh_output_bytes_of(&at, &[], 256, 0), MESH_OUTPUT_LIMIT);
+        let mut over = at.clone();
+        over.push(el(0, 1));
+        assert!(mesh_output_bytes_of(&over, &[], 256, 0) > MESH_OUTPUT_LIMIT);
+    }
+
+    #[test]
+    fn a_container_without_a_mesh_program_has_no_mesh_output_size() {
+        let bytes = crate::dxbc::build(&[]);
+        assert!(matches!(mesh_output_bytes(&bytes), Ok(None)));
     }
 }

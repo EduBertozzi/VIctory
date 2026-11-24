@@ -66,6 +66,9 @@ pub(crate) struct Shader {
     /// A mesh program run as compute (hosts without mesh shaders).
     #[cfg(windows)]
     mesh_fallback: OnceLock<Option<victory_shader::emit::MeshFallback>>,
+    /// Whether its mesh program outputs more than D3D12 allows a mesh shader.
+    #[cfg(windows)]
+    mesh_over_limit: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -93,6 +96,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 mesh_fallback: OnceLock::new(),
+                #[cfg(windows)]
+                mesh_over_limit: OnceLock::new(),
             })
         })
         .clone()
@@ -156,6 +161,27 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+
+    /// Whether its mesh program outputs more per group than D3D12's
+    /// [`MESH_OUTPUT_LIMIT`](victory_shader::emit::MESH_OUTPUT_LIMIT) allows
+    /// a mesh shader (the device refuses such a pipeline), so that it must
+    /// run as compute even on a host with mesh shaders; logged once.
+    pub(crate) fn mesh_over_limit(&self) -> bool {
+        *self.mesh_over_limit.get_or_init(|| {
+            match victory_shader::emit::mesh_output_bytes(&self.container) {
+                Ok(Some(bytes)) if bytes > victory_shader::emit::MESH_OUTPUT_LIMIT => {
+                    tracing::info!(
+                        hash = %self.hash,
+                        bytes,
+                        limit = victory_shader::emit::MESH_OUTPUT_LIMIT,
+                        "mesh shader outputs more than D3D12 allows; it runs as compute"
+                    );
+                    true
+                }
+                _ => false,
+            }
+        })
     }
 }
 
