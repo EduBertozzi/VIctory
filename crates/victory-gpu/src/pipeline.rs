@@ -63,6 +63,9 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// A mesh program run as compute (hosts without mesh shaders).
+    #[cfg(windows)]
+    mesh_fallback: OnceLock<Option<victory_shader::emit::MeshFallback>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -88,6 +91,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                mesh_fallback: OnceLock::new(),
             })
         })
         .clone()
@@ -121,6 +126,32 @@ impl Shader {
                         hash = %self.hash,
                         error = %e,
                         "shader does not translate; its pipelines' draws are dropped"
+                    ),
+                }
+                done.ok()
+            })
+            .as_ref()
+    }
+
+    /// The mesh program run as compute and drawn by a vertex shader, made on
+    /// first use; one that does not translate is logged once.
+    // shortcut: not kept in the shader cache; it is translated afresh each
+    // run (the experiment of issue #3).
+    pub(crate) fn mesh_fallback(&self) -> Option<&victory_shader::emit::MeshFallback> {
+        self.mesh_fallback
+            .get_or_init(|| {
+                let done = victory_shader::emit::translate_mesh_as_compute(&self.container);
+                match &done {
+                    Ok(f) => tracing::info!(
+                        hash = %self.hash,
+                        layout = ?f.layout,
+                        drawable = f.vertex.is_some(),
+                        "mesh shader translated as compute"
+                    ),
+                    Err(e) => tracing::warn!(
+                        hash = %self.hash,
+                        error = %e,
+                        "mesh shader does not translate as compute"
                     ),
                 }
                 done.ok()

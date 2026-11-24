@@ -287,6 +287,9 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Shader-writable memory for what mesh programs run as compute write
+    /// (see [`HostList::mesh_scratch`]), reused after a reset.
+    mesh_scratch: Mutex<MeshScratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -366,6 +369,14 @@ struct Scratch {
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+
+/// Default-heap buffers a list's mesh fallback draws write and read, one per
+/// draw while they last: each draw moves its whole buffer between states.
+#[derive(Default)]
+struct MeshScratch {
+    buffers: Vec<(ID3D12Resource, u64)>,
+    next: usize,
+}
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -449,6 +460,19 @@ impl Host {
         })
     }
 
+    /// Whether mesh pipelines run their mesh program as compute and draw
+    /// what it wrote with a vertex shader (issue #3): on hosts without mesh
+    /// shaders, or everywhere with `VICTORY_MESH_FALLBACK=1` (to compare).
+    pub(crate) fn mesh_fallback(&self) -> bool {
+        static FALLBACK: OnceLock<bool> = OnceLock::new();
+        *FALLBACK.get_or_init(|| {
+            let forced = std::env::var("VICTORY_MESH_FALLBACK").is_ok_and(|v| v == "1");
+            let fallback = forced || !self.mesh_shaders();
+            tracing::info!(fallback, forced, "mesh programs run as compute");
+            fallback
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -477,6 +501,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                mesh_scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
@@ -889,6 +914,10 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
+        self.mesh_scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next = 0;
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1105,6 +1134,29 @@ impl HostList {
         let at = s.used;
         s.used += len;
         Some((gpu + at, (data + at as usize) as *mut u8))
+    }
+
+    /// A shader-writable buffer of at least `len` bytes for one mesh fallback
+    /// draw, in COMMON state; the draw leaves it so. Each draw of the list
+    /// gets its own buffer until the list is reset, so a draw's transitions
+    /// never touch another's data.
+    // shortcut: one buffer per draw (grown, never shared); a pool sliced by
+    // offset with UAV barriers would take less memory.
+    pub(crate) fn mesh_scratch(&self, len: u64) -> Option<ID3D12Resource> {
+        let len = len.max(256).next_power_of_two();
+        let mut s = self.mesh_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let n = s.next;
+        if n == s.buffers.len() || s.buffers[n].1 < len {
+            let buffer = host()?.uav_buffer(len)?;
+            name(&buffer, || format!("mesh fallback scratch {len:#x}"));
+            if n == s.buffers.len() {
+                s.buffers.push((buffer, len));
+            } else {
+                s.buffers[n] = (buffer, len);
+            }
+        }
+        s.next += 1;
+        Some(s.buffers[n].0.clone())
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -1392,6 +1444,46 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 }
 
 impl Host {
+    /// A buffer in the default heap that shaders may write, in COMMON state
+    /// (buffers are promoted from there on first use).
+    pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a buffer.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        };
+        if let Err(e) = made {
+            tracing::warn!(size, error = %e, "no shader-writable buffer");
+            return None;
+        }
+        buffer
+    }
+
     /// A buffer in the upload heap, mapped for writing.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {

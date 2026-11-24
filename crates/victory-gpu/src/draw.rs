@@ -416,6 +416,22 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.bind_as(list, p, &p.pso, &p.stages, compute, compute)
+    }
+
+    /// [`State::bind`] of `stages` with `pso`, reading the title's compute
+    /// (`roots`) or graphics root arguments and setting them on the host's
+    /// compute (`compute`) or graphics bindings: a mesh program run as
+    /// compute reads the graphics arguments into the compute bindings.
+    fn bind_as(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        pso: &ID3D12PipelineState,
+        stages: &[crate::pipeline::host::Stage],
+        roots: bool,
+        compute: bool,
+    ) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -447,19 +463,19 @@ impl State {
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        if self.host_pipeline != pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
-            unsafe { l.SetPipelineState(&p.pso) };
-            self.host_pipeline = p.pso.as_raw() as usize;
+            unsafe { l.SetPipelineState(pso) };
+            self.host_pipeline = pso.as_raw() as usize;
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
+            list.keep(pso);
             list.keep(&p.root);
         }
-        for stage in &p.stages {
+        for stage in stages {
             let t = stage.translated();
             self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, roots);
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -479,7 +495,7 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
+                        None => self.user_value(roots, u.slot, u.root, u.dword),
                     };
                 }
                 // SAFETY: an open list; `values` covers the parameter.
@@ -493,7 +509,7 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                    let Some(Root::View(address)) = self.roots_ref(roots).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
@@ -586,11 +602,110 @@ impl State {
         text
     }
 
+    /// A mesh dispatch of `x` groups with a pipeline drawn without mesh
+    /// shaders: its mesh program runs as compute into a buffer of the list,
+    /// then the fallback vertex shader draws the triangles it wrote. False
+    /// if it cannot run.
+    fn dispatch_mesh_fallback(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        f: &crate::pipeline::host::MeshFallback,
+        x: u32,
+    ) -> bool {
+        if x == 0 {
+            return true;
+        }
+        let [vertices, indices, prims] = f.layout.bytes(x);
+        let aligned = |n: u64| n.next_multiple_of(256);
+        let (at_indices, at_prims) = (aligned(vertices), aligned(vertices) + aligned(indices));
+        let Ok(index_bytes) = u32::try_from(indices) else {
+            once!(x, "a mesh fallback draw with more than 4 GiB of indices");
+            return false;
+        };
+        let Some(buffer) = list.mesh_scratch(at_prims + prims) else {
+            return false;
+        };
+        list.keep(&buffer);
+        // The mesh stage, with the title's graphics arguments, as compute.
+        if !self.bind_as(list, p, &f.compute, &p.stages[..1], false, true) {
+            return false;
+        }
+        let l = &list.list;
+        // SAFETY: an open list; the buffer lives until the list is reset.
+        let base = unsafe { buffer.GetGPUVirtualAddress() };
+        let barrier = |before, after| D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    // SAFETY: a borrowed pointer; the barrier never releases it.
+                    pResource: unsafe { std::mem::transmute_copy(&buffer) },
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        };
+        let read =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER;
+        // The buffer serves this one draw of the list, so it starts COMMON
+        // (new, or decayed after its last list ran) and ends COMMON.
+        // SAFETY: an open list with the compute pass bound.
+        unsafe {
+            l.ResourceBarrier(&[barrier(
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            for (param, at) in f.outputs.into_iter().zip([0, at_indices, at_prims]) {
+                l.SetComputeRootUnorderedAccessView(param, base + at);
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("mesh {x} as compute"), false));
+            l.Dispatch(x, 1, 1);
+            l.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read)]);
+        }
+        // Then the draw, as any draw (it sets the graphics pipeline again).
+        let drawn = self.prepare_for(list, false, true);
+        if drawn {
+            // SAFETY: an open list with the draw bound.
+            unsafe {
+                l.SetGraphicsRootShaderResourceView(f.vertices, base);
+                l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                    BufferLocation: base + at_indices,
+                    SizeInBytes: index_bytes,
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                }));
+                l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4)); // triangle list
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text(format!("mesh {x} drawn"), false));
+                l.DrawIndexedInstanced(3 * f.layout.max_primitives * x, 1, 0, 0, 0);
+            }
+            // Later draws keep the title's topology.
+            self.set_topology(list, self.topology);
+        }
+        // SAFETY: an open list; the buffer is back to COMMON.
+        unsafe { l.ResourceBarrier(&[barrier(read, D3D12_RESOURCE_STATE_COMMON)]) };
+        drawn
+    }
+
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+            && let Some(f) = &p.fallback
+        {
+            if self.dispatch_mesh_fallback(list, p, f, x) {
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            } else {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                dropped(self.pipeline);
+            }
+            return;
+        }
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -1020,6 +1135,15 @@ impl State {
         self.host_roots[1] = 0;
         let ran = match kind {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            // shortcut: indirect mesh dispatches of a pipeline drawn without
+            // mesh shaders are dropped (the group count is on the GPU; the
+            // fallback would need it to size and draw its buffers).
+            MESH if crate::pipeline::host_pipeline(self.pipeline as This)
+                .is_some_and(|p| p.fallback.is_some()) =>
+            {
+                once!("indirect mesh dispatches without mesh shaders dropped");
+                false
+            }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
