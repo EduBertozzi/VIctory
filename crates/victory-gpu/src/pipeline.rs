@@ -134,13 +134,12 @@ impl Shader {
     }
 
     /// The mesh program run as compute and drawn by a vertex shader, made on
-    /// first use; one that does not translate is logged once.
-    // shortcut: not kept in the shader cache; it is translated afresh each
-    // run (the experiment of issue #3).
+    /// first use (or read from the shader cache); one that does not
+    /// translate is logged once.
     pub(crate) fn mesh_fallback(&self) -> Option<&victory_shader::emit::MeshFallback> {
         self.mesh_fallback
             .get_or_init(|| {
-                let done = victory_shader::emit::translate_mesh_as_compute(&self.container);
+                let done = crate::shader_cache::mesh_fallback(&self.container);
                 match &done {
                     Ok(f) => tracing::info!(
                         hash = %self.hash,

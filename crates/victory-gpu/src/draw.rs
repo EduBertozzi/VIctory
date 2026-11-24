@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
-use crate::host::HostList;
+use crate::host::{HostList, ScratchPool, transition};
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
@@ -624,48 +624,38 @@ impl State {
             return false;
         };
         // (At least a little past `u2`'s start, so its address is in the
-        // buffer even when the program has no per-primitive outputs.)
-        let Some(buffer) = list.mesh_scratch(at_prims + prims.max(16)) else {
+        // region even when the program has no per-primitive outputs.)
+        let Some(region) = list.mesh_scratch(at_prims + prims.max(16), ScratchPool::Data) else {
             return false;
         };
-        list.keep(&buffer);
+        let buffer = &region.buffer;
+        list.keep(buffer);
+        let l = &list.list;
+        let (uav, read) = (
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER,
+        );
+        // The chunk's first use in the list: out of COMMON at once, so its
+        // state is UNORDERED_ACCESS whatever happens below.
+        if region.first {
+            // SAFETY: an open list and a live buffer.
+            unsafe { l.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_COMMON, uav)]) };
+        }
         // The mesh stage, with the title's graphics arguments, as compute.
         if !self.bind_as(list, p, &f.compute, &p.stages[..1], false, true) {
             return false;
         }
-        let l = &list.list;
-        // SAFETY: an open list; the buffer lives until the list is reset.
-        let base = unsafe { buffer.GetGPUVirtualAddress() };
-        let barrier = |before, after| D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                    // SAFETY: a borrowed pointer; the barrier never releases it.
-                    pResource: unsafe { std::mem::transmute_copy(&buffer) },
-                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                    StateBefore: before,
-                    StateAfter: after,
-                }),
-            },
-        };
-        let read =
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDEX_BUFFER;
-        // The buffer serves this one draw of the list, so it starts COMMON
-        // (new, or decayed after its last list ran) and ends COMMON.
+        // SAFETY: the buffer lives until the list is reset.
+        let base = unsafe { buffer.GetGPUVirtualAddress() } + region.offset;
         // SAFETY: an open list with the compute pass bound.
         unsafe {
-            l.ResourceBarrier(&[barrier(
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            )]);
             for (param, at) in f.outputs.into_iter().zip([0, at_indices, at_prims]) {
                 l.SetComputeRootUnorderedAccessView(param, base + at);
             }
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("mesh {x} as compute"), false));
             l.Dispatch(x, 1, 1);
-            l.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read)]);
+            l.ResourceBarrier(&[transition(buffer, uav, read)]);
         }
         // Then the draw, as any draw (it sets the graphics pipeline again).
         let drawn = self.prepare_for(list, false, true);
@@ -694,8 +684,9 @@ impl State {
             // Later draws keep the title's topology.
             self.set_topology(list, self.topology);
         }
-        // SAFETY: an open list; the buffer is back to COMMON.
-        unsafe { l.ResourceBarrier(&[barrier(read, D3D12_RESOURCE_STATE_COMMON)]) };
+        // SAFETY: an open list; the chunk is back in UNORDERED_ACCESS for the
+        // list's next draws.
+        unsafe { l.ResourceBarrier(&[transition(buffer, read, uav)]) };
         drawn
     }
 
@@ -711,7 +702,6 @@ impl State {
         (args, stride, records): (u64, u32, u32),
         count: Option<u64>,
     ) -> bool {
-        use crate::host::transition;
         use crate::mesh_indirect::{COMPUTE_STRIDE, draw_stride};
         let (Some(signatures), Some(convert)) = (&f.signatures, crate::mesh_indirect::convert())
         else {
@@ -734,17 +724,21 @@ impl State {
             return false;
         };
         let (Some(data), Some(commands)) = (
-            list.mesh_scratch(regions.bytes),
-            list.mesh_scratch(commands_len),
+            list.mesh_scratch(regions.bytes, ScratchPool::Data),
+            list.mesh_scratch(commands_len, ScratchPool::Commands),
         ) else {
             return false;
         };
-        list.keep(&data);
-        list.keep(&commands);
+        list.keep(&data.buffer);
+        list.keep(&commands.buffer);
         let l = &list.list;
         // SAFETY: an open list; the buffers live until the list is reset.
-        let (base, commands_gpu) =
-            unsafe { (data.GetGPUVirtualAddress(), commands.GetGPUVirtualAddress()) };
+        let (base, commands_gpu) = unsafe {
+            (
+                data.buffer.GetGPUVirtualAddress() + data.offset,
+                commands.buffer.GetGPUVirtualAddress() + commands.offset,
+            )
+        };
         let plan = crate::mesh_indirect::plan(
             (records, stride, count.is_some()),
             &f.layout,
@@ -760,18 +754,21 @@ impl State {
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         );
-        // Both buffers serve this one execution of the list: COMMON at both
-        // ends. The pass reads the records the clamp just wrote.
-        // SAFETY: an open list and live buffers.
-        unsafe {
-            l.ResourceBarrier(&[
-                transition(&data, common, uav),
-                transition(&commands, common, uav),
-            ]);
+        // The chunks rest in UNORDERED_ACCESS (out of COMMON on their first
+        // use in the list). The pass reads the records the clamp just wrote.
+        let (data_buffer, commands_buffer) = (&data.buffer, &commands.buffer);
+        let first: Vec<_> = [&data, &commands]
+            .into_iter()
+            .filter(|r| r.first)
+            .map(|r| transition(&r.buffer, common, uav))
+            .collect();
+        if !first.is_empty() {
+            // SAFETY: an open list and live buffers.
+            unsafe { l.ResourceBarrier(&first) };
         }
         crate::mesh_indirect::record(l, convert, &plan, args, count, commands_gpu);
         // SAFETY: an open list and a live buffer.
-        unsafe { l.ResourceBarrier(&[transition(&commands, uav, argument)]) };
+        unsafe { l.ResourceBarrier(&[transition(commands_buffer, uav, argument)]) };
         // The pass replaced the compute root signature and pipeline.
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -782,8 +779,15 @@ impl State {
             unsafe {
                 #[cfg(feature = "diagnostics")]
                 list.note_op(|| self.op_text(format!("indirect mesh {records} as compute"), false));
-                l.ExecuteIndirect(&signatures.compute, records, &commands, 0, None, 0);
-                l.ResourceBarrier(&[transition(&data, uav, read)]);
+                l.ExecuteIndirect(
+                    &signatures.compute,
+                    records,
+                    commands_buffer,
+                    commands.offset,
+                    None,
+                    0,
+                );
+                l.ResourceBarrier(&[transition(data_buffer, uav, read)]);
             }
             drawn = self.prepare_for(list, false, true);
             if drawn {
@@ -807,18 +811,23 @@ impl State {
                     }
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("indirect mesh {records} drawn"), false));
-                    l.ExecuteIndirect(&signatures.draw, records, &commands, draws, None, 0);
+                    l.ExecuteIndirect(
+                        &signatures.draw,
+                        records,
+                        commands_buffer,
+                        commands.offset + draws,
+                        None,
+                        0,
+                    );
                 }
                 self.set_topology(list, self.topology);
             }
             // SAFETY: an open list and a live buffer.
-            unsafe { l.ResourceBarrier(&[transition(&data, read, common)]) };
-        } else {
-            // SAFETY: an open list and a live buffer.
-            unsafe { l.ResourceBarrier(&[transition(&data, uav, common)]) };
+            unsafe { l.ResourceBarrier(&[transition(data_buffer, read, uav)]) };
         }
+        // Both chunks back in UNORDERED_ACCESS for the list's next draws.
         // SAFETY: an open list and a live buffer.
-        unsafe { l.ResourceBarrier(&[transition(&commands, argument, common)]) };
+        unsafe { l.ResourceBarrier(&[transition(commands_buffer, argument, uav)]) };
         drawn
     }
 
